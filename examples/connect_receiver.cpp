@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -25,6 +26,7 @@
 #include <openssl/evp.h>
 #include "librespot/audio/cdn_source.h"
 #include "librespot/audio/paced_player.h"
+#include "librespot/audio/wav_writer.h"
 #include "librespot/cache/credentials.h"
 #include "librespot/connect/receiver.h"
 #include "librespot/core/spotify_uri.h"
@@ -69,12 +71,48 @@ std::string stable_id(std::string const &name) {
   return result;
 }
 
+struct recording {
+  std::filesystem::path path;
+  librespot::log_handler on_log;
+  std::optional<librespot::audio::wav_writer> writer;
+
+  void append(librespot::audio::pcm_frame const &frame) {
+    if(!writer) {
+      writer.emplace(path, frame.format());
+      librespot::emit_log(on_log, librespot::log_level::info, "recording", "Writing PCM to " + path.string());
+    }
+    writer->append(frame);
+  }
+
+  boost::asio::awaitable<void> finish() {
+    if(writer) {
+      writer->finish();
+      librespot::emit_log(on_log, librespot::log_level::info, "recording", "Finalized WAV " + path.string());
+    }
+    co_return;
+  }
+};
+
+boost::asio::awaitable<void> play(librespot::audio::paced_player &player, std::shared_ptr<recording> output,
+  boost::asio::any_io_executor worker) {
+  std::exception_ptr failure;
+  try {
+    co_await player.run();
+  } catch(...) {
+    failure = std::current_exception();
+  }
+  if(output) co_await boost::asio::co_spawn(worker, output->finish(), boost::asio::use_awaitable);
+  if(failure) std::rethrow_exception(failure);
+}
+
 struct application : std::enable_shared_from_this<application> {
   boost::asio::any_io_executor executor;
   boost::asio::any_io_executor worker;
   librespot::net::http_transport &http;
   librespot::connect::receiver_config config;
   std::filesystem::path credentials_path;
+  std::optional<std::filesystem::path> output_path;
+  unsigned int recordings{0};
   std::unique_ptr<librespot::session> session;
   std::unique_ptr<librespot::oauth::service_auth> auth;
   std::unique_ptr<librespot::connect::receiver> receiver;
@@ -87,8 +125,8 @@ struct application : std::enable_shared_from_this<application> {
   bool stopped{false};
 
   application(boost::asio::any_io_executor executor, boost::asio::any_io_executor worker, librespot::net::http_transport &http,
-    librespot::connect::receiver_config config, std::filesystem::path credentials_path)
-    : executor{std::move(executor)}, worker{std::move(worker)}, http{http}, config{std::move(config)}, credentials_path{std::move(credentials_path)}, player_finished{this->executor} {
+    librespot::connect::receiver_config config, std::filesystem::path credentials_path, std::optional<std::filesystem::path> output_path)
+    : executor{std::move(executor)}, worker{std::move(worker)}, http{http}, config{std::move(config)}, credentials_path{std::move(credentials_path)}, output_path{std::move(output_path)}, player_finished{this->executor} {
     player_finished.expires_at(std::chrono::steady_clock::time_point::max());
   }
 
@@ -162,14 +200,23 @@ struct application : std::enable_shared_from_this<application> {
         librespot::audio::cdn_source_config{.container_offset{librespot::service::is_vorbis(file.format) ? 167u : 0u}})};
       playing_uri = state.track.uri;
       playing_duration = track.duration;
+      std::shared_ptr<recording> output;
+      std::function<void(librespot::audio::pcm_frame const &)> sink;
+      if(output_path) {
+        auto path{*output_path};
+        if(++recordings > 1) path = path.parent_path() / (path.stem().string() + '-' + std::to_string(recordings) + path.extension().string());
+        output = std::make_shared<recording>(std::move(path), config.on_log, std::nullopt);
+        sink = [output](librespot::audio::pcm_frame const &frame){ output->append(frame); };
+      }
       player = std::make_unique<librespot::audio::paced_player>(worker,
         [source]{ return std::make_unique<librespot::audio::decoder>(source); },
-        librespot::audio::paced_player_config{.position{state.position}, .paused{state.paused}, .cancel_source{[source]{ source->cancel(); }}, .on_log{config.on_log}});
+        librespot::audio::paced_player_config{.position{state.position}, .paused{state.paused}, .on_frame{std::move(sink)},
+          .cancel_source{[source]{ source->cancel(); }}, .on_log{config.on_log}});
       librespot::emit_log(config.on_log, librespot::log_level::info, "playback", "Opening " + track.name + "; "
         + std::string{librespot::service::to_string(file.format)} + "; duration_ms=" + std::to_string(track.duration.count()));
       player_running = true;
       auto self{shared_from_this()};
-      boost::asio::co_spawn(executor, player->run(), [self](std::exception_ptr failure){
+      boost::asio::co_spawn(executor, play(*player, std::move(output), worker), [self](std::exception_ptr failure){
         if(failure) {
           try { std::rethrow_exception(failure); }
           catch(std::exception const &error) { librespot::emit_log(self->config.on_log, librespot::log_level::error, "playback", librespot::diagnostic_error(error)); }
@@ -291,6 +338,7 @@ auto main(int argc, char const *argv[])->int try {
     ("name", boost::program_options::value<std::string>()->default_value("C++ Connect test"), "Device name in Spotify")
     ("device-id", boost::program_options::value<std::string>(), "Stable device identity; otherwise derived from machine ID and name")
     ("credentials", boost::program_options::value<std::string>()->default_value("connect_credentials.json"), "Owner-only reusable credential file")
+    ("output", boost::program_options::value<std::string>(), "Record consumed PCM to WAV; later streams use -2, -3 suffixes")
     ("brand", boost::program_options::value<std::string>()->default_value(""), "Application device brand")
     ("model", boost::program_options::value<std::string>()->default_value(""), "Application device model")
     ("client-id", boost::program_options::value<std::string>()->default_value(librespot::connect::device_config{}.client_id), "Spotify protocol client identity")
@@ -317,8 +365,10 @@ auto main(int argc, char const *argv[])->int try {
   boost::asio::thread_pool worker{2};
   auto const agent{arguments.at("user-agent").as<std::string>()};
   librespot::net::http_client http{executor.get_executor(), {.user_agent{agent}, .on_log{logger}}};
+  std::optional<std::filesystem::path> output;
+  if(arguments.contains("output")) output = arguments.at("output").as<std::string>();
   auto app{std::make_shared<application>(executor.get_executor(), worker.get_executor(), http,
-    librespot::connect::receiver_config{.device{identity}, .dealer{.user_agent{agent}}, .on_log{logger}}, arguments.at("credentials").as<std::string>())};
+    librespot::connect::receiver_config{.device{identity}, .dealer{.user_agent{agent}}, .on_log{logger}}, arguments.at("credentials").as<std::string>(), std::move(output))};
   librespot::discovery::server discovery{executor.get_executor(), {
     .device{identity}, .address{arguments.at("bind").as<std::string>()}, .port{arguments.at("port").as<std::uint16_t>()},
     .advertise{!arguments.at("no-discovery").as<bool>()}, .active_user{}, .on_error{[logger](std::string message){

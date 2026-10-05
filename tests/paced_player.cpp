@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
@@ -10,6 +11,7 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/use_future.hpp>
 #include "librespot/audio/paced_player.h"
+#include "librespot/audio/wav_writer.h"
 
 namespace {
 namespace asio = boost::asio;
@@ -32,6 +34,7 @@ std::shared_ptr<std::vector<std::byte> const> wav(unsigned int samples) {
   write(34, 16, 2);
   std::memcpy(bytes->data() + 36, "data", 4);
   write(40, samples * 2, 4);
+  for(unsigned int sample{0}; sample < samples; ++sample) write(44 + sample * 2, sample * 31 % 32767, 2);
   return bytes;
 }
 
@@ -122,4 +125,47 @@ TEST_CASE("Paced PCM exposes decoder failures without leaving a playback clock r
   CHECK(player.snapshot().paused);
   CHECK_FALSE(player.snapshot().buffering);
   CHECK_THROWS(player.seek(-1ms));
+}
+
+TEST_CASE("A cancelled paced PCM recording finalizes a readable WAV with nonzero samples") {
+  struct temporary_file {
+    std::filesystem::path path{std::filesystem::temp_directory_path() / ("librespot-paced-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".wav")};
+    ~temporary_file() {
+      std::error_code ignored;
+      std::filesystem::remove(path, ignored);
+    }
+  } output;
+  asio::io_context executor;
+  asio::thread_pool worker{1};
+  auto bytes{wav(32'000)};
+  std::optional<librespot::audio::wav_writer> writer;
+  librespot::audio::paced_player player{worker.get_executor(), [bytes]{ return std::make_unique<librespot::audio::decoder>(bytes); },
+    {.paused{false}, .on_frame{[&](librespot::audio::pcm_frame const &frame){
+      if(!writer) writer.emplace(output.path, frame.format());
+      writer->append(frame);
+    }}}};
+  auto running{asio::co_spawn(executor, player.run(), asio::use_future)};
+  auto stop{asio::co_spawn(executor, [&]()->asio::awaitable<void> {
+    co_await delay(350ms);
+    player.close();
+  }, asio::use_future)};
+  executor.run();
+  stop.get();
+  running.get();
+  worker.join();
+  REQUIRE(writer);
+  writer->finish();
+  auto const samples{player.snapshot().samples};
+  CHECK(samples > 0);
+  CHECK(samples < 32'000);
+  CHECK(std::filesystem::file_size(output.path) == 44 + samples * 2);
+  librespot::audio::decoder recorded{output.path};
+  std::uint64_t decoded{0};
+  bool nonzero{false};
+  while(auto frame{recorded.next()}) {
+    decoded += frame->sample_count();
+    for(auto byte : frame->plane(0)) nonzero = nonzero || byte != std::byte{0};
+  }
+  CHECK(decoded == samples);
+  CHECK(nonzero);
 }
