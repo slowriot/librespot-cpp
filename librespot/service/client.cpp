@@ -54,7 +54,8 @@ struct client::implementation {
     endpoints = std::move(result);
   }
 
-  asio::awaitable<std::string> request(std::string target, std::string method = "GET", std::string body = {}) {
+  asio::awaitable<std::string> request(std::string target, std::string method = "GET", std::string body = {},
+    std::map<std::string, std::string> extra_headers = {}) {
     co_await resolve();
     std::exception_ptr failure;
     for(unsigned int retry{0}; retry < 2; ++retry) {
@@ -64,10 +65,12 @@ struct client::implementation {
       for(auto const &address : endpoints) {
         net::http_response response;
         try {
+          auto headers{extra_headers};
+          headers.insert({{"Authorization", token.type + ' ' + token.value}, {"client-token", client_token},
+            {"Accept", "application/x-protobuf"}, {"Content-Type", "application/x-protobuf"}});
           response = co_await transport.request({
             .host{address.host}, .port{address.port}, .target{target}, .method{method},
-            .headers{{"Authorization", token.type + ' ' + token.value}, {"client-token", client_token},
-              {"Accept", "application/x-protobuf"}, {"Content-Type", "application/x-protobuf"}},
+            .headers{std::move(headers)},
             .body{body},
           });
         } catch(boost::system::system_error const &error) {
@@ -84,7 +87,7 @@ struct client::implementation {
           failure = std::make_exception_ptr(std::runtime_error{"service returned HTTP " + std::to_string(response.status)});
           continue;
         }
-        if(response.status != 200) throw std::runtime_error{"service returned HTTP " + std::to_string(response.status)};
+        if(response.status < 200 || response.status >= 300) throw std::runtime_error{"service returned HTTP " + std::to_string(response.status)};
         co_return std::move(response.body);
       }
       if(!refresh) break;
@@ -99,6 +102,17 @@ client::client(net::http_transport &transport, oauth::service_auth &auth)
 }
 
 client::~client() = default;
+
+asio::awaitable<void> client::put_connect_state(std::string device_id, std::string connection_id, std::string protobuf) {
+  if(device_id.empty() || connection_id.empty()) throw std::invalid_argument{"Connect identity is required"};
+  co_await state->request("/connect-state/v1/devices/" + net::form_encode(device_id), "PUT", std::move(protobuf),
+    {{"Spotify-Connection-Id", std::move(connection_id)}});
+}
+
+asio::awaitable<void> client::delete_connect_state(std::string device_id) {
+  if(device_id.empty()) throw std::invalid_argument{"Connect device ID is required"};
+  co_await state->request("/connect-state/v1/devices/" + net::form_encode(device_id), "DELETE");
+}
 
 storage_unavailable::storage_unavailable() : std::runtime_error{"audio file is restricted or has no supported CDN storage"} {
 }

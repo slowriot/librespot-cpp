@@ -2,7 +2,7 @@
 
 A C++23 library port of librespot for Linux applications. The protocol reference is upstream commit `939dc5ee9d833e1980f9495241219d9d4868a061`.
 
-The port is under development. The implemented components are usable independently, but this repository does **not yet provide a complete Spotify player or Spotify Connect receiver**.
+The port is under development. It provides independently usable components, a streaming PCM demonstration, and a control-only Spotify Connect receiver. It does not yet provide a complete Spotify player. Live Spotify account interoperability has not yet been validated.
 
 ## Build
 
@@ -12,6 +12,7 @@ Requirements:
 - Boost 1.81 or newer. Example applications additionally use Boost.Program_options.
 - OpenSSL 3 or newer, development headers, and a system CA trust store.
 - Git, Make, and NASM for the default FFmpeg source build.
+- pkg-config, Avahi client development headers, and zlib development headers. LAN discovery requires a running Avahi daemon and system D-Bus. On Debian these packages are `libavahi-client-dev`, `zlib1g-dev`, and `avahi-daemon`.
 
 CMake fetches pinned nlohmann JSON, Protobuf and its Abseil dependency, FFmpeg, and Catch2 sources from GitHub. The FFmpeg archive is checked against a SHA-256 digest. FFmpeg is built with just the required audio demuxers, decoders and parsers; NASM preserves its x86 assembly optimisations. Initial configuration requires network access.
 
@@ -48,6 +49,10 @@ The library target propagates C++23 and its public include directories. Audio de
 | `oauth::device_auth` | Device pairing, individual token polls and refresh-token exchange through an injectable transport. |
 | `oauth::service_auth` | Client-token and Login5 authentication with bounded hashcash challenges, token caching and refresh. |
 | `service::client` | Service address resolution, authenticated track metadata, supported audio format selection and CDN storage resolution. |
+| `discovery::server`, `pairing` | Avahi DNS-SD advertisement, bounded local HTTP pairing, authenticated DH/AES credential exchange, and account reset. |
+| `net::dealer` | Verified TLS websocket transport, bounded messages, automatic websocket ping/pong and application-owned user agents. |
+| `connect::receiver` | Dealer address resolution and reconnection, authenticated Connect registration, typed commands, acknowledgements and state publication. |
+| `connect::apply_control` | A control-only state model for transfer, pause/resume, seek, volume, options and queues. |
 | `net::access_point` | Address resolution, signed Diffie-Hellman handshake, authenticated Shannon packets and reusable-credential login. |
 | `session` | An internal strand, bounded outgoing queue, concurrent Mercury/audio-key request dispatch, deadlines and delayed pong keepalive. |
 | `net::encode_mercury`, `decode_mercury`, `mercury_assembler` | Mercury framing and bounded fragmented-response assembly. |
@@ -124,7 +129,7 @@ Tests run offline against independent cipher/HMAC vectors, conversion vectors, g
 
 Streaming tests verify that the first PCM frame precedes a complete download, compare every sample of encrypted input, exercise seek/cache eviction and cancellation, and round-trip mono/stereo WAV output without changing integer or floating-point sample values. Service tests exercise client-token and Login5 hashcash challenges, token caching and a rejected-token refresh, metadata identity checks, and restricted storage responses.
 
-The Spotify authentication, metadata and streaming path has not yet been verified against a live Premium account. Album/artist/episode metadata, regional track alternatives, prefetch and persistent audio caching, player control/events, normalisation, discovery/zeroconf, and Spotify Connect state/control remain to be implemented. The presence of protocol schemas does not imply those features are implemented.
+The Spotify authentication, metadata and streaming path has not yet been verified against a live Premium account. Album/artist/episode metadata, regional track alternatives, prefetch and persistent audio caching, full player events and context resolution, and normalisation remain to be implemented. The presence of protocol schemas does not imply those features are implemented.
 
 `session` serialises its internal work on its own strand and accepts independent concurrent requests. Packet callbacks execute on that strand and should return promptly. Its outgoing queue and pending request sets are bounded. A closed session must be recreated; automatic reconnection and resubscription are not implemented yet.
 
@@ -133,3 +138,21 @@ The Spotify authentication, metadata and streaming path has not yet been verifie
 ## Licence
 
 The C++ project uses the MIT licence in `LICENSE`. Upstream notices are retained in `LICENSES`; fetched dependencies retain their own licences.
+
+## Control-only Spotify Connect example
+
+With Avahi running, launch the receiver on the same LAN as your Spotify phone or desktop:
+
+```sh
+./build/connect_receiver --name "C++ test device" --credentials ./connect_credentials.json
+```
+
+Open Spotify's device picker and select the named device. The local pairing flow authenticates through the access point and Login5; no separate OAuth application or manually supplied track ID is needed. Accepted reusable credentials are saved in an owner-only file and loaded on the next start. Device identity defaults to a hash of the Linux machine ID and device name; use `--device-id` to retain a chosen identity across machine/name changes. `--brand`, `--model`, `--client-id`, and `--user-agent` configure application identity. The library itself supplies no default user agent.
+
+This example prints commands and publishes a control-only player state. It produces no audio and does not advance a playback clock, fetch playlist/context pages, or resolve missing tracks. Transfers with a supplied current track, pause/resume, seek, volume, options, and explicit queue operations can be inspected without connecting an audio backend. Unknown or invalid commands are acknowledged as failures; applications decide which commands they accept. Premium-account operation follows the upstream implementation's requirements.
+
+`--bind` and `--port` control the pairing listener; its default is a dual-stack listener on an available port. `--no-discovery` disables Avahi publication for local HTTP testing. The endpoint supports `GET /?action=getInfo` and form-encoded `POST /` actions `addUser` and `resetUsers`. Authentication must succeed before `addUser` returns success or exposes an active user. Reset withdraws the account's Connect registration and deletes the example's credential file. Ctrl-C withdraws the device and stops discovery.
+
+For embedding, combine `discovery::server` with your authentication/credential persistence policy, then create `oauth::service_auth` and `connect::receiver`. The command handler receives typed input and a proposed `player_state`; it updates that state and returns whether it accepted the command. The receiver publishes accepted state with command IDs and sends the Dealer reply. Keep HTTP, authentication, workers and executors alive until `receiver::shutdown()` and `discovery::server::shutdown()` complete. Call `close()` to request cancellation; destruction alone does not wait for asynchronous operations. Give service authentication to one receiver at a time, and await shutdown before replacing accounts. The example retains an access-point session for keepalive; the receiver itself consumes service authentication and Dealer transport.
+
+Offline tests cover independently generated pairing credentials, malformed envelopes, the real local HTTP server and TLS websocket, gzip limits, Connect registration and withdrawal, command acceptance/rejection, transfer state, queue controls, and token refresh on reconnection. Avahi publication, advertised SRV/TXT records, the local HTTP identity, and service removal on shutdown have also been checked against the system daemon. Device selection and command flow with a live Spotify account remain to be validated. Spotify's private protocols can change independently of this pinned reference.

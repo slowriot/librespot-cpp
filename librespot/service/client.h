@@ -56,6 +56,9 @@ public:
   client &operator=(client const &) = delete;
   boost::asio::awaitable<track> get_track(spotify_id id);
   boost::asio::awaitable<std::vector<std::string>> resolve_audio(file_id id);
+  /// Low-level Connect operations; receiver normally supplies the private protobuf encoding
+  boost::asio::awaitable<void> put_connect_state(std::string device_id, std::string connection_id, std::string protobuf);
+  boost::asio::awaitable<void> delete_connect_state(std::string device_id);
 };
 
 /// Prefer native lossless quality when available; only return supported decoder formats

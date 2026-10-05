@@ -20,6 +20,23 @@ if(NOT abseil_memory_source MATCHES "#include <cstdint>")
   file(WRITE "${abseil_memory_header}" "${abseil_memory_source}")
 endif()
 add_library(librespot_protocol STATIC
+  protocol/connect.proto
+  protocol/context.proto
+  protocol/context_page.proto
+  protocol/context_player_options.proto
+  protocol/context_track.proto
+  protocol/devices.proto
+  protocol/instrumentation_params.proto
+  protocol/media.proto
+  protocol/play_history.proto
+  protocol/play_origin.proto
+  protocol/playback.proto
+  protocol/player.proto
+  protocol/queue.proto
+  protocol/restrictions.proto
+  protocol/session.proto
+  protocol/suppressions.proto
+  protocol/transfer_state.proto
   protocol/keyexchange.proto
   protocol/authentication.proto
   protocol/mercury.proto
@@ -39,7 +56,7 @@ add_library(librespot_protocol STATIC
   protocol/spotify/login5/v3/identifiers/identifiers.proto
 )
 target_link_libraries(librespot_protocol PUBLIC protobuf::libprotobuf)
-target_include_directories(librespot_protocol PUBLIC "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/protocol")
+target_include_directories(librespot_protocol SYSTEM PUBLIC "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/protocol")
 get_target_property(protobuf_include_dirs libprotobuf INTERFACE_INCLUDE_DIRECTORIES)
 target_include_directories(librespot_protocol SYSTEM PUBLIC ${protobuf_include_dirs})
 protobuf_generate(TARGET librespot_protocol IMPORT_DIRS "${PROJECT_SOURCE_DIR}/protocol" "${protobuf_SOURCE_DIR}/src")

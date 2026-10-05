@@ -19,6 +19,9 @@ if(LIBRESPOT_BUILD_EXAMPLES)
 endif()
 find_package(OpenSSL 3.0 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client)
 
 fetchcontent_declare(nlohmann_json
   GIT_REPOSITORY https://github.com/nlohmann/json.git
@@ -52,6 +55,13 @@ add_library(librespot
   librespot/crypto/hashcash.cpp
   librespot/cache/credentials.cpp
   librespot/encoding/base64.cpp
+  librespot/encoding/protocol.cpp
+  librespot/discovery/pairing.cpp
+  librespot/discovery/server.cpp
+  librespot/discovery/advertisement.cpp
+  librespot/net/dealer.cpp
+  librespot/connect/control.cpp
+  librespot/connect/receiver.cpp
 )
 add_library(librespot::librespot ALIAS librespot)
 target_compile_features(librespot PUBLIC cxx_std_23)
@@ -69,6 +79,8 @@ target_link_libraries(librespot
   PRIVATE Threads::Threads
   PRIVATE librespot_ffmpeg
   PRIVATE librespot_protocol
+  PRIVATE ZLIB::ZLIB
+  PRIVATE PkgConfig::AVAHI
 )
 target_compile_options(librespot PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
 if(LIBRESPOT_ENABLE_SANITIZERS)
@@ -78,6 +90,8 @@ endif()
 if(LIBRESPOT_BUILD_EXAMPLES)
   add_executable(device_login examples/device_login.cpp)
   add_executable(pcm_stream examples/pcm_stream.cpp)
+  add_executable(connect_receiver examples/connect_receiver.cpp)
+  target_link_libraries(connect_receiver PRIVATE librespot::librespot PRIVATE Boost::program_options PRIVATE OpenSSL::Crypto)
   target_link_libraries(pcm_stream PRIVATE librespot::librespot PRIVATE Boost::program_options)
   target_link_libraries(device_login
     PRIVATE librespot::librespot
@@ -106,6 +120,8 @@ if(BUILD_TESTING)
     tests/access_token.cpp
     tests/service.cpp
     tests/streaming.cpp
+    tests/discovery.cpp
+    tests/connect.cpp
   )
   target_link_libraries(librespot_tests
     PRIVATE librespot::librespot
@@ -113,6 +129,8 @@ if(BUILD_TESTING)
     PRIVATE OpenSSL::Crypto
     PRIVATE OpenSSL::SSL
     PRIVATE librespot_protocol
+    PRIVATE nlohmann_json::nlohmann_json
+    PRIVATE ZLIB::ZLIB
   )
   target_compile_definitions(librespot_tests PRIVATE LIBRESPOT_TEST_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures")
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
