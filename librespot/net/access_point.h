@@ -55,7 +55,7 @@ private:
   boost::asio::awaitable<void> handshake();
 
 public:
-  explicit access_point(boost::asio::any_io_executor executor, std::chrono::seconds timeout = std::chrono::seconds{30});
+  explicit access_point(boost::asio::any_io_executor executor, std::chrono::seconds timeout = std::chrono::seconds{30}, log_handler on_log = {});
   ~access_point() override;
   access_point(access_point const &) = delete;
   access_point &operator=(access_point const &) = delete;

@@ -3,6 +3,7 @@
 #include <string>
 #include <boost/asio/awaitable.hpp>
 #include "access_token.h"
+#include "librespot/diagnostics.h"
 #include "librespot/net/access_point.h"
 
 namespace librespot::oauth {
@@ -13,6 +14,7 @@ struct service_auth_config {
   std::string client_token_id{"65b708073fc0480ea92a077233ca87bd"};
   /// Spotify protocol identity, independent of the application's HTTP user agent
   std::string client_version{"1.2.52.442"};
+  log_handler on_log;
 };
 
 /// Use on one network executor; supply a separate worker executor for CPU challenges

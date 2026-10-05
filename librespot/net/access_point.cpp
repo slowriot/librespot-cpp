@@ -1,5 +1,6 @@
 #include "access_point.h"
 #include <array>
+#include <format>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -66,6 +67,7 @@ struct access_point::implementation {
   asio::any_io_executor executor;
   boost::beast::tcp_stream stream;
   std::chrono::seconds timeout;
+  log_handler on_log;
   std::unique_ptr<crypto::shannon> encoder;
   std::unique_ptr<crypto::shannon> decoder;
   std::uint64_t send_nonce{0};
@@ -74,16 +76,16 @@ struct access_point::implementation {
   bool writing{false};
   bool connecting{false};
 
-  implementation(asio::any_io_executor executor, std::chrono::seconds timeout)
+  implementation(asio::any_io_executor executor, std::chrono::seconds timeout, log_handler on_log)
     : executor{executor},
       stream{executor},
-      timeout{timeout} {
+      timeout{timeout}, on_log{std::move(on_log)} {
     if(timeout.count() <= 0) throw std::invalid_argument{"invalid access-point timeout"};
   }
 };
 
-access_point::access_point(asio::any_io_executor executor, std::chrono::seconds timeout)
-  : state{std::make_unique<implementation>(executor, timeout)} {
+access_point::access_point(asio::any_io_executor executor, std::chrono::seconds timeout, log_handler on_log)
+  : state{std::make_unique<implementation>(executor, timeout, std::move(on_log))} {
   /// Bind an access-point connection to the application's executor
 }
 
@@ -91,6 +93,7 @@ access_point::~access_point() = default;
 
 asio::awaitable<void> access_point::handshake() {
   /// Verify the server signature before installing traffic keys
+  emit_log(state->on_log, log_level::debug, "access_point", "Sending Diffie-Hellman ClientHello");
   crypto::diffie_hellman local;
   auto const public_key{local.public_key()};
   protocol::ClientHello hello;
@@ -129,6 +132,7 @@ asio::awaitable<void> access_point::handshake() {
   auto const &challenge{message.challenge().login_crypto_challenge().diffie_hellman()};
   auto const remote{std::as_bytes(std::span{challenge.gs()})};
   crypto::verify_server_key(remote, std::as_bytes(std::span{challenge.gs_signature()}));
+  emit_log(state->on_log, log_level::debug, "access_point", "Server signature verified; deriving Shannon traffic keys");
   auto secret{local.shared_secret(remote)};
   auto keys{crypto::derive_keys(secret, transcript)};
   OPENSSL_cleanse(secret.data(), secret.size());
@@ -151,11 +155,14 @@ asio::awaitable<credentials> access_point::connect(endpoint address, credentials
   active_operation connection{state->connecting};
   if(state->stream.socket().is_open()) throw std::logic_error{"access point is already connected"};
   if(device_id.empty() || login.data.empty()) throw std::invalid_argument{"empty access-point login data or device ID"};
+  emit_log(state->on_log, log_level::debug, "access_point", "Resolving " + address.host + ':' + address.port);
   auto const addresses{co_await detail::resolve(state->executor, address.host, address.port, state->timeout)};
   state->stream.expires_after(state->timeout);
   co_await state->stream.async_connect(addresses, asio::use_awaitable);
+  emit_log(state->on_log, log_level::debug, "access_point", "TCP connected to " + address.host + ':' + address.port);
   state->send_nonce = state->receive_nonce = 0;
   co_await handshake();
+  emit_log(state->on_log, log_level::debug, "access_point", "Handshake complete; sending login (type " + std::to_string(static_cast<unsigned int>(login.type)) + ')');
   protocol::ClientResponseEncrypted request;
   auto const credentials{request.mutable_login_credentials()};
   auto const type{static_cast<int>(login.type)};
@@ -180,6 +187,7 @@ asio::awaitable<credentials> access_point::connect(endpoint address, credentials
   }
   if(reply.command != 0xac) throw std::runtime_error{"unexpected access-point login packet"};
   auto const welcome{parse<protocol::APWelcome>(reply.payload)};
+  emit_log(state->on_log, log_level::info, "access_point", "APWelcome accepted; reusable credentials received");
   co_return librespot::credentials{
     .username{welcome.canonical_username()},
     .type{static_cast<authentication_type>(welcome.reusable_auth_credentials_type())},
@@ -193,6 +201,7 @@ asio::awaitable<credentials> access_point::connect(endpoint address, credentials
 asio::awaitable<void> access_point::send(packet message) try {
   /// Authenticate command, length and payload with a unique packet nonce
   active_operation operation{state->writing};
+  if(state->on_log) emit_log(state->on_log, log_level::trace, "access_point", std::format("Sending packet command=0x{:02x}; bytes={}", message.command, message.payload.size()));
   if(!state->encoder || !state->stream.socket().is_open()) throw std::logic_error{"access point is not connected"};
   if(message.payload.size() > 65535) throw std::invalid_argument{"access-point payload exceeds 65535 bytes"};
   if(state->send_nonce > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error{"access-point send nonce exhausted"};
@@ -231,6 +240,7 @@ asio::awaitable<packet> access_point::receive() try {
   co_await asio::async_read(state->stream, asio::buffer(expected), asio::use_awaitable);
   auto const actual{state->decoder->finish()};
   if(CRYPTO_memcmp(actual.data(), expected.data(), actual.size()) != 0) throw std::runtime_error{"access-point packet MAC mismatch"};
+  if(state->on_log) emit_log(state->on_log, log_level::trace, "access_point", std::format("Received packet command=0x{:02x}; bytes={}", result.command, result.payload.size()));
   co_return result;
 } catch(...) {
   close();

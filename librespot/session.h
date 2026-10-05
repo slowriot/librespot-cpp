@@ -7,6 +7,7 @@
 #include <boost/asio/awaitable.hpp>
 #include "audio/decrypt.h"
 #include "core/file_id.h"
+#include "diagnostics.h"
 #include "net/mercury.h"
 #include "oauth/access_token.h"
 
@@ -17,6 +18,7 @@ struct session_config {
   std::chrono::seconds io_timeout{90};
   std::chrono::seconds request_timeout{10};
   std::function<void(net::packet const &)> on_packet;
+  log_handler on_log;
 };
 
 /// Owns dispatch and keepalive; the executor and HTTP transport must outlive the session

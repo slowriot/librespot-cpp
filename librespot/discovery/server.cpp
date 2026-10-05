@@ -109,6 +109,8 @@ struct server::implementation : std::enable_shared_from_this<implementation> {
       parse_form(params, request.body());
       auto const action{params.find("action")};
       if(action == params.end()) throw std::invalid_argument{"missing pairing action"};
+      emit_log(config.on_log, log_level::debug, "discovery", "Pairing action " + action->second);
+      if(config.on_log) emit_log(config.on_log, log_level::trace, "discovery", "Request parameters " + diagnostic_json(nlohmann::json(params).dump()));
       if(request.method() == http::verb::get && action->second == "getInfo") response.body() = protocol.get_info(config.active_user);
       else if(request.method() == http::verb::post && (action->second == "addUser" || action->second == "resetUsers")) {
         if(pairing_busy) {
@@ -127,16 +129,19 @@ struct server::implementation : std::enable_shared_from_this<implementation> {
           config.active_user.clear();
         } else {
           auto login{protocol.decode(params.at("userName"), params.at("blob"), params.at("clientKey"))};
+          emit_log(config.on_log, log_level::debug, "discovery", "Credential envelope authenticated and decrypted; awaiting Spotify authentication");
           config.active_user.clear();
           auto const accepted{co_await handler.add_user(std::move(login))};
           if(!accepted.username || accepted.data.empty()) throw std::runtime_error{"pairing authentication returned no credentials"};
           config.active_user = *accepted.username;
         }
         status(101, "OK", 0);
+        emit_log(config.on_log, log_level::info, "discovery", action->second + " completed successfully");
       } else {
         response.result(http::status::not_found);
       }
-    } catch(std::exception const &) {
+    } catch(std::exception const &error) {
+      emit_log(config.on_log, log_level::warning, "discovery", "Pairing request rejected: " + diagnostic_error(error));
       status(102, "ERROR-LOGIN", 1);
     }
     co_return response;
@@ -149,7 +154,10 @@ struct server::implementation : std::enable_shared_from_this<implementation> {
     parser.header_limit(8192);
     stream->expires_after(std::chrono::seconds{30});
     co_await http::async_read(*stream, buffer, parser, asio::use_awaitable);
+    emit_log(config.on_log, log_level::debug, "discovery", std::string{parser.get().method_string()} + " " + diagnostic_url(std::string_view{parser.get().target()})
+      + "; body bytes=" + std::to_string(parser.get().body().size()));
     auto response{co_await respond(parser.release())};
+    if(config.on_log) emit_log(config.on_log, log_level::trace, "discovery", "Response HTTP " + std::to_string(response.result_int()) + " " + diagnostic_json(response.body()));
     response.keep_alive(false);
     response.prepare_payload();
     stream->expires_after(std::chrono::seconds{10});
@@ -162,7 +170,9 @@ struct server::implementation : std::enable_shared_from_this<implementation> {
   asio::awaitable<void> run() {
     if(running || stopped) throw std::logic_error{"pairing server cannot be restarted"};
     running = true;
+    emit_log(config.on_log, log_level::info, "discovery", "Pairing listener " + config.address + ':' + std::to_string(config.port));
     if(config.advertise) publication = std::make_unique<advertisement>(executor, config.device.name, config.port, config.on_error);
+    emit_log(config.on_log, log_level::info, "discovery", config.advertise ? "Avahi publication requested for _spotify-connect._tcp; VERSION=1.0; CPath=/" : "Avahi publication disabled");
     while(!stopped) {
       boost::system::error_code error;
       auto socket{co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error))};
@@ -171,10 +181,19 @@ struct server::implementation : std::enable_shared_from_this<implementation> {
         throw boost::system::system_error{error};
       }
       if(connections.size() >= 16) continue;
+      auto const peer{socket.remote_endpoint()};
+      emit_log(config.on_log, log_level::debug, "discovery", "Incoming pairing connection from " + peer.address().to_string() + ':' + std::to_string(peer.port()));
       auto stream{std::make_shared<beast::tcp_stream>(std::move(socket))};
       connections.insert(stream);
       auto self{shared_from_this()};
-      asio::co_spawn(executor, serve(stream), [self, stream](std::exception_ptr){
+      asio::co_spawn(executor, serve(stream), [self, stream](std::exception_ptr failure){
+        if(failure && !self->stopped) {
+          try {
+            std::rethrow_exception(failure);
+          } catch(std::exception const &error) {
+            emit_log(self->config.on_log, log_level::warning, "discovery", "HTTP connection failed: " + diagnostic_error(error));
+          }
+        }
         self->connections.erase(stream);
         if(self->connections.empty()) self->drained.cancel();
       });

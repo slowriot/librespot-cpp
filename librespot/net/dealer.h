@@ -6,12 +6,14 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include "access_point.h"
+#include "librespot/diagnostics.h"
 
 namespace librespot::net {
 
 struct dealer_config {
   std::optional<std::string> user_agent;
   std::chrono::seconds timeout{30};
+  log_handler on_log;
 };
 
 /// Sequential operations on one executor; close cancels pending reads and writes

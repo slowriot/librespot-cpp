@@ -47,6 +47,8 @@ public:
   std::vector<std::string> connection_ids;
   unsigned int deletes{0};
   unsigned int tokens{0};
+  bool reject_registration{false};
+  std::string registration_error{R"({"error":"bad device","access_token":"must-not-be-logged"})"};
 
   asio::awaitable<librespot::net::http_response> request(librespot::net::http_request request) override {
     if(request.host == "apresolve.spotify.com") {
@@ -76,11 +78,17 @@ public:
       co_return librespot::net::http_response{204, {}, {}};
     }
     CHECK(request.method == "PUT");
+    if(reject_registration) co_return librespot::net::http_response{400, {{"Content-Type", "application/json"}}, registration_error};
     proto::PutStateRequest state;
     REQUIRE(state.ParseFromString(request.body));
-    connection_ids.push_back(request.headers.at("Spotify-Connection-Id"));
+    CHECK_FALSE(request.headers.contains("Spotify-Connection-Id"));
+    connection_ids.push_back(request.headers.at("X-Spotify-Connection-Id"));
     registrations.push_back(std::move(state));
-    co_return librespot::net::http_response{200, {}, {}};
+    proto::Cluster cluster;
+    auto const &published{registrations.back()};
+    cluster.set_active_device_id(published.is_active() ? "device" : "controller");
+    *cluster.mutable_player_state() = published.device().player_state();
+    co_return librespot::net::http_response{200, {}, cluster.SerializeAsString()};
   }
 };
 
@@ -185,6 +193,8 @@ TEST_CASE("Connect registers, accepts compressed controls, rejects unsupported c
   CHECK(initial.put_state_reason() == proto::NEW_DEVICE);
   CHECK(initial.device().device_info().name() == "owning-program");
   CHECK(initial.device().device_info().brand() == "brand");
+  CHECK(initial.device().player_state().session_id().size() == 32);
+  CHECK(initial.device().player_state().session_id() != "device");
   CHECK(initial.device().device_info().capabilities().supports_command_request());
   CHECK_FALSE(initial.device().device_info().capabilities().supports_logout());
   auto const &last{http.registrations.back()};
@@ -194,6 +204,11 @@ TEST_CASE("Connect registers, accepts compressed controls, rejects unsupported c
   CHECK(last.last_command_message_id() == 42);
   CHECK(last.last_command_sent_by_device_id() == "controller");
   CHECK(last.is_active());
+  CHECK(initial.started_playing_at() == 0);
+  CHECK(http.registrations.at(1).started_playing_at() > 0);
+  CHECK(last.started_playing_at() == http.registrations.at(1).started_playing_at());
+  CHECK(last.device().player_state().context_url() == "context://spotify:track:0123456789012345678901");
+  CHECK(last.device().player_state().is_playing());
   for(auto const &id : http.connection_ids) CHECK(id == "connection-one");
 }
 
@@ -227,6 +242,113 @@ TEST_CASE("Connect reconnects with a refreshed token and accepts a new Dealer co
   REQUIRE(http.connection_ids.size() == 2);
   CHECK(http.connection_ids.front() == "connection-two");
   CHECK(http.deletes == 1);
+}
+
+TEST_CASE("Connect handoff publishes active ownership before acknowledging the transfer") {
+  bool paused{false};
+  SECTION("Paused playback remains paused after handoff") {
+    paused = true;
+  }
+  SECTION("Playing playback remains playing after handoff") {
+    paused = false;
+  }
+  asio::io_context executor;
+  asio::thread_pool worker{1};
+  fake_http http;
+  librespot::oauth::service_auth auth{http, {.device_id{"device"}},
+    {.username{"username"}, .type{librespot::authentication_type::stored_spotify}, .data{"stored"}}, worker.get_executor()};
+  auto dealer{std::make_shared<fake_dealer>(executor.get_executor())};
+  std::string diagnostics;
+  librespot::connect::receiver receiver{executor.get_executor(), http, auth,
+    {.device{.id{"device"}, .name{"test"}}, .reconnect{false}, .on_log{[&](librespot::log_event const &event){
+      diagnostics += event.message + '\n';
+    }}},
+    [](librespot::connect::command const &command, librespot::connect::player_state &state)->asio::awaitable<bool> {
+      co_return librespot::connect::apply_control(command, state);
+    }, dealer};
+  spotify::player::proto::transfer::TransferState transfer;
+  transfer.mutable_playback()->set_is_paused(paused);
+  transfer.mutable_playback()->mutable_current_track()->set_gid(std::string{"\xb3\x9f\xe8\x08\x1e\x1f\x4c\x54\xbe\x38\xe8\xd6\xf9\xf1\x2b\xb9", 16});
+  transfer.mutable_playback()->set_position_as_of_timestamp(1234);
+  transfer.mutable_current_session()->mutable_context()->set_uri("spotify:playlist:context");
+  dealer->on_connect = [&](unsigned int){
+    dealer->push(connection("connection-id"));
+    dealer->push(request("handoff", {{"endpoint", "transfer"}, {"data", base64::encode(transfer.SerializeAsString())}}, true));
+  };
+  dealer->completed = [&]{
+    REQUIRE(http.registrations.size() == 2);
+    auto const &published{http.registrations.back()};
+    CHECK(published.is_active());
+    CHECK(published.started_playing_at() > 0);
+    CHECK(published.started_playing_at() <= published.client_side_timestamp());
+    CHECK(published.last_command_message_id() == 42);
+    CHECK(published.last_command_sent_by_device_id() == "controller");
+    CHECK(published.device().player_state().context_url() == "context://spotify:playlist:context");
+    CHECK(published.device().player_state().track().uri() == "spotify:track:5sWHDYs0csV6RS48xBl0tH");
+    CHECK(published.device().player_state().position_as_of_timestamp() == 1234);
+    CHECK(published.device().player_state().is_playing());
+    CHECK(published.device().player_state().is_paused() == paused);
+    CHECK(published.device().player_state().is_buffering() == paused);
+    CHECK(published.device().player_state().playback_speed() == (paused ? 0.0 : 1.0));
+    CHECK(dealer->replies.back().at("payload").at("success") == true);
+    receiver.close();
+  };
+  auto running{asio::co_spawn(executor, receiver.run(), asio::use_future)};
+  executor.run();
+  running.get();
+  worker.join();
+  CHECK(dealer->replies.size() == 1);
+  CHECK(http.deletes == 1);
+  CHECK(diagnostics.find("Connect response active_device=device; this_device_active=true") != std::string::npos);
+}
+
+TEST_CASE("Connect transfer resolves binary track IDs and selects the current queued track") {
+  spotify::player::proto::transfer::TransferState transfer;
+  auto *current{transfer.mutable_playback()->mutable_current_track()};
+  current->set_gid(std::string{"\xb3\x9f\xe8\x08\x1e\x1f\x4c\x54\xbe\x38\xe8\xd6\xf9\xf1\x2b\xb9", 16});
+  current->set_uid("current-uid");
+  auto *queued{transfer.mutable_queue()->add_tracks()};
+  queued->set_gid(std::string(16, '\0'));
+  queued->set_uid("queued-uid");
+  transfer.mutable_queue()->add_tracks()->set_uri("spotify:track:next");
+  auto decode{[&]{
+    return librespot::connect::decode_command(nlohmann::json{{"message_id", 7}, {"sent_by_device_id", "controller"},
+      {"command", {{"endpoint", "transfer"}, {"data", base64::encode(transfer.SerializeAsString())}}}}.dump());
+  }};
+  SECTION("Binary GIDs supply URIs for the current track and queue") {
+    auto const command{decode()};
+    REQUIRE(command.transferred_state);
+    CHECK(command.transferred_state->track.uri == "spotify:track:5sWHDYs0csV6RS48xBl0tH");
+    CHECK(command.transferred_state->track.uid == "current-uid");
+    REQUIRE(command.transferred_state->next_tracks.size() == 2);
+    CHECK(command.transferred_state->next_tracks.front().uri == "spotify:track:0000000000000000000000");
+  }
+  SECTION("A playing queue supplies the current track without duplicating it") {
+    transfer.mutable_queue()->set_is_playing_queue(true);
+    auto const command{decode()};
+    REQUIRE(command.transferred_state);
+    CHECK(command.transferred_state->track.uri == "spotify:track:0000000000000000000000");
+    CHECK(command.transferred_state->track.uid == "queued-uid");
+    REQUIRE(command.transferred_state->next_tracks.size() == 1);
+    CHECK(command.transferred_state->next_tracks.front().uri == "spotify:track:next");
+  }
+  SECTION("An explicit URI takes precedence over a binary GID") {
+    current->set_uri("spotify:track:explicit");
+    CHECK(decode().transferred_state->track.uri == "spotify:track:explicit");
+  }
+  SECTION("Invalid GID length is rejected") {
+    current->set_gid("short");
+    CHECK_THROWS(decode());
+  }
+  SECTION("A track without either identifier is rejected") {
+    current->clear_gid();
+    CHECK_THROWS(decode());
+  }
+  SECTION("A playing queue without a current track is rejected") {
+    transfer.mutable_queue()->set_is_playing_queue(true);
+    transfer.mutable_queue()->clear_tracks();
+    CHECK_THROWS(decode());
+  }
 }
 
 TEST_CASE("Connect transfer decodes protobuf state, options and queues without an audio backend") {
@@ -328,4 +450,39 @@ TEST_CASE("Dealer rejects a trusted certificate for the wrong hostname and relea
   executor.run();
   server.get();
   CHECK_THROWS(client.get());
+}
+
+TEST_CASE("Registration failure diagnostics preserve HTTP status, protocol stage and redacted server error") {
+  asio::io_context executor;
+  asio::thread_pool worker{1};
+  fake_http http;
+  http.reject_registration = true;
+  SECTION("JSON server error") {
+  }
+  SECTION("Plain server error echoing request credentials") {
+    http.registration_error = "bad device: access-1 client-token";
+  }
+  librespot::oauth::service_auth auth{http, {.device_id{"device"}},
+    {.username{"username"}, .type{librespot::authentication_type::stored_spotify}, .data{"stored"}}, worker.get_executor()};
+  auto dealer{std::make_shared<fake_dealer>(executor.get_executor())};
+  std::string output;
+  librespot::connect::receiver receiver{executor.get_executor(), http, auth,
+    {.device{.id{"device"}, .name{"test"}}, .reconnect{false}, .on_log{[&](librespot::log_event const &event){
+      output += event.message + '\n';
+    }}}, [](librespot::connect::command const &, librespot::connect::player_state &)->asio::awaitable<bool> {
+      co_return false;
+    }, dealer};
+  dealer->on_connect = [&](unsigned int){
+    dealer->push(connection("connection-id"));
+  };
+  auto running{asio::co_spawn(executor, receiver.run(), asio::use_future)};
+  executor.run();
+  CHECK_THROWS(running.get());
+  worker.join();
+  CHECK(output.find("Dealer message handling / Connect registration failed") != std::string::npos);
+  CHECK(output.find("returned HTTP 400") != std::string::npos);
+  CHECK(output.find("bad device") != std::string::npos);
+  CHECK(output.find("must-not-be-logged") == std::string::npos);
+  CHECK(output.find("access-1") == std::string::npos);
+  CHECK(output.find("client-token") == std::string::npos);
 }

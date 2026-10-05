@@ -1,12 +1,15 @@
 #include <array>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <format>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <syncstream>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -20,6 +23,25 @@
 #include "librespot/session.h"
 
 namespace {
+
+librespot::log_level log_level(std::string const &name) {
+  for(auto level : {librespot::log_level::trace, librespot::log_level::debug, librespot::log_level::info,
+    librespot::log_level::warning, librespot::log_level::error, librespot::log_level::off}) {
+    auto text{std::string{librespot::to_string(level)}};
+    for(auto &byte : text) if(byte >= 'A' && byte <= 'Z') byte = static_cast<char>(byte - 'A' + 'a');
+    if(name == text) return level;
+  }
+  throw std::invalid_argument{"--log-level must be trace, debug, info, warning, error, or off"};
+}
+
+librespot::log_handler console_logger(librespot::log_level minimum) {
+  if(minimum == librespot::log_level::off) return {};
+  return [minimum, start{std::chrono::steady_clock::now()}](librespot::log_event const &event){
+    if(event.level < minimum) return;
+    auto const elapsed{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)};
+    std::osyncstream{std::cerr} << std::format("[{:>8}ms] [{:7}] [{}] {}", elapsed.count(), librespot::to_string(event.level), event.component, event.message) << std::endl;
+  };
+}
 
 std::string stable_id(std::string const &name) {
   /// Derive a stable example identity from the machine ID and application device name
@@ -55,6 +77,7 @@ struct application : std::enable_shared_from_this<application> {
   }
 
   boost::asio::awaitable<void> disconnect() {
+    librespot::emit_log(config.on_log, librespot::log_level::debug, "example", "Disconnecting account services");
     if(receiver) co_await receiver->shutdown();
     receiver.reset();
     auth.reset();
@@ -65,37 +88,46 @@ struct application : std::enable_shared_from_this<application> {
   boost::asio::awaitable<librespot::credentials> login(librespot::credentials credentials, bool replacing_account = true) {
     if(stopped) throw std::runtime_error{"receiver is stopping"};
     co_await disconnect();
+    librespot::emit_log(config.on_log, librespot::log_level::info, "example", replacing_account ? "Authenticating newly paired account" : "Authenticating saved reusable credentials");
     if(replacing_account) {
       std::error_code removed;
       std::filesystem::remove(credentials_path, removed);
       if(removed) throw std::system_error{removed, "cannot clear previous account credentials"};
     }
-    session = std::make_unique<librespot::session>(executor, http, librespot::session_config{.device_id{config.device.id}});
+    session = std::make_unique<librespot::session>(executor, http, librespot::session_config{.device_id{config.device.id}, .on_log{config.on_log}});
     auto reusable{co_await session->connect(std::move(credentials))};
     if(stopped) {
       session->close();
       throw std::runtime_error{"receiver is stopping"};
     }
     auth = std::make_unique<librespot::oauth::service_auth>(http,
-      librespot::oauth::service_auth_config{.device_id{config.device.id}, .client_id{config.device.client_id}}, reusable, worker);
+      librespot::oauth::service_auth_config{.device_id{config.device.id}, .client_id{config.device.client_id}, .on_log{config.on_log}}, reusable, worker);
     co_await auth->token();
     if(stopped) throw std::runtime_error{"receiver is stopping"};
     librespot::cache::save_credentials(credentials_path, reusable);
+    librespot::emit_log(config.on_log, librespot::log_level::debug, "example", "Reusable credentials saved; starting Connect receiver");
     receiver = std::make_unique<librespot::connect::receiver>(executor, http, *auth, config,
-      [](librespot::connect::command const &command, librespot::connect::player_state &state)->boost::asio::awaitable<bool> {
+      [log{config.on_log}](librespot::connect::command const &command, librespot::connect::player_state &state)->boost::asio::awaitable<bool> {
         auto const accepted{librespot::connect::apply_control(command, state)};
-        std::cout << "Command " << command.endpoint << ": " << (accepted ? "accepted" : "unsupported")
-          << "; track " << state.track.uri << "; position " << state.position.count() << " ms; volume " << state.volume << std::endl;
+        librespot::emit_log(log, librespot::log_level::info, "example", std::format("Command {}: {}; track={}; position_ms={}; volume={}",
+          command.endpoint, accepted ? "accepted" : "unsupported", librespot::diagnostic_url(state.track.uri), state.position.count(), state.volume));
         co_return accepted;
       });
     auto self{shared_from_this()};
     boost::asio::co_spawn(executor, receiver->run(), [self](std::exception_ptr failure){
-      if(failure && !self->stopped) std::cerr << "Connect receiver stopped" << std::endl;
+      if(failure && !self->stopped) {
+        try {
+          std::rethrow_exception(failure);
+        } catch(std::exception const &error) {
+          librespot::emit_log(self->config.on_log, librespot::log_level::error, "example", "Connect receiver stopped: " + librespot::diagnostic_error(error));
+        }
+      }
     });
     co_return reusable;
   }
 
   boost::asio::awaitable<void> reset() {
+    librespot::emit_log(config.on_log, librespot::log_level::info, "example", "Resetting paired account and removing credentials");
     co_await disconnect();
     std::error_code error;
     std::filesystem::remove(credentials_path, error);
@@ -103,6 +135,7 @@ struct application : std::enable_shared_from_this<application> {
   }
 
   void stop() {
+    if(!stopped) librespot::emit_log(config.on_log, librespot::log_level::info, "example", "Shutdown requested");
     stopped = true;
     if(receiver) receiver->close();
     if(session) session->close();
@@ -118,8 +151,9 @@ boost::asio::awaitable<void> run(std::shared_ptr<application> app, librespot::di
         auto const accepted{co_await app->login(std::move(*stored), false)};
         discovery.set_active_user(accepted.username.value_or(""));
         authenticated = true;
-      } catch(std::exception const &) {
-        if(!app->stopped) std::cerr << "Saved account could not be authenticated; waiting for local pairing" << std::endl;
+      } catch(std::exception const &error) {
+        if(!app->stopped) librespot::emit_log(app->config.on_log, librespot::log_level::warning, "example", "Saved account could not be authenticated: "
+          + librespot::diagnostic_error(error) + "; waiting for local pairing");
       }
       if(!authenticated) co_await app->disconnect();
     }
@@ -150,6 +184,7 @@ auto main(int argc, char const *argv[])->int try {
     ("model", boost::program_options::value<std::string>()->default_value(""), "Application device model")
     ("client-id", boost::program_options::value<std::string>()->default_value(librespot::connect::device_config{}.client_id), "Spotify protocol client identity")
     ("user-agent", boost::program_options::value<std::string>()->default_value("connect_receiver"), "Application HTTP/websocket user agent")
+    ("log-level", boost::program_options::value<std::string>()->default_value("debug"), "Diagnostics: trace, debug, info, warning, error, off")
     ("bind", boost::program_options::value<std::string>()->default_value("::"), "Pairing listener address")
     ("port", boost::program_options::value<std::uint16_t>()->default_value(0), "Pairing port; zero chooses an available port")
     ("no-discovery", boost::program_options::bool_switch(), "Disable mDNS publication for local protocol testing");
@@ -160,6 +195,7 @@ auto main(int argc, char const *argv[])->int try {
     return EXIT_SUCCESS;
   }
   boost::program_options::notify(arguments);
+  auto const logger{console_logger(log_level(arguments.at("log-level").as<std::string>()))};
   auto const name{arguments.at("name").as<std::string>()};
   librespot::connect::device_config identity{
     .id{arguments.contains("device-id") ? arguments.at("device-id").as<std::string>() : stable_id(name)},
@@ -169,16 +205,14 @@ auto main(int argc, char const *argv[])->int try {
   boost::asio::io_context executor;
   boost::asio::thread_pool worker{1};
   auto const agent{arguments.at("user-agent").as<std::string>()};
-  librespot::net::http_client http{executor.get_executor(), {.user_agent{agent}}};
+  librespot::net::http_client http{executor.get_executor(), {.user_agent{agent}, .on_log{logger}}};
   auto app{std::make_shared<application>(executor.get_executor(), worker.get_executor(), http,
-    librespot::connect::receiver_config{.device{identity}, .dealer{.user_agent{agent}}, .on_status{[](std::string message){
-      std::cout << message << std::endl;
-    }}}, arguments.at("credentials").as<std::string>())};
+    librespot::connect::receiver_config{.device{identity}, .dealer{.user_agent{agent}}, .on_log{logger}}, arguments.at("credentials").as<std::string>())};
   librespot::discovery::server discovery{executor.get_executor(), {
     .device{identity}, .address{arguments.at("bind").as<std::string>()}, .port{arguments.at("port").as<std::uint16_t>()},
-    .advertise{!arguments.at("no-discovery").as<bool>()}, .active_user{}, .on_error{[](std::string message){
-      std::cerr << message << std::endl;
-    }},
+    .advertise{!arguments.at("no-discovery").as<bool>()}, .active_user{}, .on_error{[logger](std::string message){
+      librespot::emit_log(logger, librespot::log_level::error, "discovery", std::move(message));
+    }}, .on_log{logger},
   }, {.add_user{[app](librespot::credentials credentials)->boost::asio::awaitable<librespot::credentials> {
     co_return co_await app->login(std::move(credentials));
   }}, .reset_users{[app]()->boost::asio::awaitable<void> {

@@ -70,7 +70,7 @@ struct session::implementation {
     : executor{asio::make_strand(executor)},
       transport{transport},
       config{std::move(config)},
-      connection{connection ? std::move(connection) : std::make_shared<net::access_point>(this->executor, this->config.io_timeout)},
+      connection{connection ? std::move(connection) : std::make_shared<net::access_point>(this->executor, this->config.io_timeout, this->config.on_log)},
       outgoing{this->executor, 64},
       pong_timer{this->executor} {
     if(this->config.device_id.empty() || this->config.request_timeout.count() <= 0) throw std::invalid_argument{"invalid session configuration"};
@@ -165,11 +165,13 @@ struct session::implementation {
         flag = false;
       }
     } reset{self->connecting};
+    emit_log(self->config.on_log, log_level::debug, "session", "Resolving access-point endpoints");
     auto const addresses{co_await net::resolve_access_points(self->transport)};
     if(self->stopped) throw boost::system::system_error{asio::error::operation_aborted};
     std::exception_ptr failure;
     for(auto const &address : addresses) {
       try {
+        emit_log(self->config.on_log, log_level::debug, "session", "Connecting to access point " + address.host + ':' + address.port);
         auto reusable{co_await self->connection->connect(address, login, self->config.device_id)};
         if(login.type == authentication_type::spotify_token) {
           /// Match upstream: token login supplies credentials for a reusable session
@@ -184,7 +186,16 @@ struct session::implementation {
         self->outgoing.reset();
         self->active = true;
         auto finish{[self](std::exception_ptr failure){
-          if(failure) self->stop();
+          if(failure) {
+            if(!self->stopped) {
+              try {
+                std::rethrow_exception(failure);
+              } catch(std::exception const &error) {
+                emit_log(self->config.on_log, log_level::error, "session", "Access-point session task failed: " + diagnostic_error(error));
+              }
+            }
+            self->stop();
+          }
         }};
         asio::co_spawn(self->executor, write_packets(self), finish);
         asio::co_spawn(self->executor, read_packets(self), finish);
@@ -196,6 +207,14 @@ struct session::implementation {
           throw;
         }
         if(error.code() == asio::error::operation_aborted) throw;
+        emit_log(self->config.on_log, log_level::warning, "session", "Access point " + address.host + ':' + address.port + " failed: " + diagnostic_error(error));
+        failure = std::current_exception();
+      } catch(std::exception const &error) {
+        if(self->active) {
+          self->stop();
+          throw;
+        }
+        emit_log(self->config.on_log, log_level::warning, "session", "Access point " + address.host + ':' + address.port + " failed: " + diagnostic_error(error));
         failure = std::current_exception();
       } catch(...) {
         if(self->active) {

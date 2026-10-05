@@ -1,8 +1,11 @@
 #include "control.h"
 #include <algorithm>
 #include <limits>
+#include <span>
 #include <stdexcept>
+#include <utility>
 #include <nlohmann/json.hpp>
+#include "librespot/core/spotify_id.h"
 #include "librespot/encoding/protocol.h"
 #include "transfer_state.pb.h"
 
@@ -11,6 +14,17 @@ namespace {
 
 provided_track track(nlohmann::json const &object) {
   return {.uri{object.value("uri", "")}, .uid{object.value("uid", "")}};
+}
+
+provided_track track(spotify::player::proto::ContextTrack const &source) {
+  auto uri{source.uri()};
+  if(uri.empty() && !source.gid().empty()) {
+    auto const id{spotify_id::from_bytes(std::as_bytes(std::span{source.gid().data(), source.gid().size()}))};
+    if(!id) throw std::runtime_error{"invalid Connect transfer track GID"};
+    uri = "spotify:track:" + id->to_base62();
+  }
+  if(uri.empty()) throw std::runtime_error{"Connect transfer track has neither URI nor GID"};
+  return {.uri{std::move(uri)}, .uid{source.uid()}};
 }
 
 std::vector<provided_track> tracks(nlohmann::json const &object, char const *key) {
@@ -81,13 +95,16 @@ command decode_command(std::string const &json) {
     state.active = true;
     state.paused = transfer.playback().is_paused();
     state.position = std::chrono::milliseconds{std::max(0, transfer.playback().position_as_of_timestamp())};
-    state.track = {.uri{transfer.playback().current_track().uri()}, .uid{transfer.playback().current_track().uid()}};
+    auto const &queue{transfer.queue()};
+    if(queue.tracks_size() > 1024) throw std::runtime_error{"Connect transfer queue too large"};
+    auto const playing_queue{queue.is_playing_queue()};
+    if(playing_queue && queue.tracks().empty()) throw std::runtime_error{"Connect transfer playing queue is empty"};
+    state.track = track(playing_queue ? queue.tracks(0) : transfer.playback().current_track());
     state.context_uri = transfer.current_session().context().uri();
     state.shuffle = transfer.options().shuffling_context();
     state.repeat_context = transfer.options().repeating_context();
     state.repeat_track = transfer.options().repeating_track();
-    if(transfer.queue().tracks_size() > 1024) throw std::runtime_error{"Connect transfer queue too large"};
-    for(auto const &item : transfer.queue().tracks()) state.next_tracks.push_back({.uri{item.uri()}, .uid{item.uid()}});
+    for(int index{playing_queue ? 1 : 0}; index < queue.tracks_size(); ++index) state.next_tracks.push_back(track(queue.tracks(index)));
     result.transferred_state = std::move(state);
   }
   return result;

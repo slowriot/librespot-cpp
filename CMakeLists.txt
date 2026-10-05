@@ -33,6 +33,7 @@ include(cmake/ffmpeg.cmake)
 include(cmake/protocol.cmake)
 
 add_library(librespot
+  librespot/diagnostics.cpp
   librespot/session.cpp
   librespot/core/spotify_id.cpp
   librespot/core/file_id.cpp
@@ -122,6 +123,7 @@ if(BUILD_TESTING)
     tests/streaming.cpp
     tests/discovery.cpp
     tests/connect.cpp
+    tests/diagnostics.cpp
   )
   target_link_libraries(librespot_tests
     PRIVATE librespot::librespot

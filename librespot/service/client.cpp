@@ -1,4 +1,5 @@
 #include "client.h"
+#include <algorithm>
 #include <charconv>
 #include <optional>
 #include <span>
@@ -6,6 +7,7 @@
 #include <boost/asio/error.hpp>
 #include <boost/system/system_error.hpp>
 #include <nlohmann/json.hpp>
+#include "connect.pb.h"
 #include "extended_metadata.pb.h"
 #include "metadata.pb.h"
 #include "storage-resolve.pb.h"
@@ -21,14 +23,33 @@ bool supported(int format) {
   }
 }
 
+std::string error_text(std::string text, std::string const &token, std::string const &client_token) {
+  /// Plain service errors may describe rejected fields; remove known header credentials before logging
+  if(!std::ranges::all_of(text, [](unsigned char byte){
+    return byte == 9 || byte == 10 || byte == 13 || (byte >= 32 && byte < 127);
+  })) return "<binary service error; " + std::to_string(text.size()) + " bytes>";
+  for(auto const *secret : {&token, &client_token}) {
+    if(secret->empty()) continue;
+    std::size_t offset{0};
+    while((offset = text.find(*secret, offset)) != std::string::npos) {
+      text.replace(offset, secret->size(), "<redacted>");
+      offset += 10;
+    }
+  }
+  for(auto &byte : text) if(byte == '\r' || byte == '\n' || byte == '\t') byte = ' ';
+  if(text.size() > 2048) text = text.substr(0, 2048) + "<truncated>";
+  return text;
+}
+
 } // anonymous namespace
 
 struct client::implementation {
   net::http_transport &transport;
   oauth::service_auth &auth;
+  log_handler on_log;
   std::vector<net::endpoint> endpoints;
 
-  implementation(net::http_transport &transport, oauth::service_auth &auth) : transport{transport}, auth{auth} {
+  implementation(net::http_transport &transport, oauth::service_auth &auth, log_handler on_log) : transport{transport}, auth{auth}, on_log{std::move(on_log)} {
   }
 
   asio::awaitable<void> resolve() {
@@ -63,6 +84,7 @@ struct client::implementation {
       auto const client_token{co_await auth.client_token()};
       bool refresh{false};
       for(auto const &address : endpoints) {
+        emit_log(on_log, log_level::debug, "service", method + " " + address.host + ':' + address.port + diagnostic_url(target));
         net::http_response response;
         try {
           auto headers{extra_headers};
@@ -79,15 +101,22 @@ struct client::implementation {
           continue;
         }
         if(response.status == 401 && retry == 0) {
+          emit_log(on_log, log_level::warning, "service", "HTTP 401; invalidating access token and retrying once");
           auth.invalidate_token();
           refresh = true;
           break;
         }
         if(response.status >= 500) {
+          emit_log(on_log, log_level::warning, "service", "HTTP " + std::to_string(response.status) + "; trying next endpoint");
           failure = std::make_exception_ptr(std::runtime_error{"service returned HTTP " + std::to_string(response.status)});
           continue;
         }
-        if(response.status < 200 || response.status >= 300) throw std::runtime_error{"service returned HTTP " + std::to_string(response.status)};
+        emit_log(on_log, log_level::debug, "service", "Response HTTP " + std::to_string(response.status) + "; bytes=" + std::to_string(response.body.size()));
+        if(response.status < 200 || response.status >= 300) {
+          if(on_log && !response.body.empty()) emit_log(on_log, log_level::warning, "service", "Error response "
+            + ((response.body.front() == '{' || response.body.front() == '[') ? diagnostic_json(response.body) : error_text(response.body, token.value, client_token)));
+          throw std::runtime_error{method + " " + address.host + diagnostic_url(target) + " returned HTTP " + std::to_string(response.status)};
+        }
         co_return std::move(response.body);
       }
       if(!refresh) break;
@@ -97,16 +126,27 @@ struct client::implementation {
   }
 };
 
-client::client(net::http_transport &transport, oauth::service_auth &auth)
-  : state{std::make_unique<implementation>(transport, auth)} {
+client::client(net::http_transport &transport, oauth::service_auth &auth, log_handler on_log)
+  : state{std::make_unique<implementation>(transport, auth, std::move(on_log))} {
 }
 
 client::~client() = default;
 
 asio::awaitable<void> client::put_connect_state(std::string device_id, std::string connection_id, std::string protobuf) {
   if(device_id.empty() || connection_id.empty()) throw std::invalid_argument{"Connect identity is required"};
-  co_await state->request("/connect-state/v1/devices/" + net::form_encode(device_id), "PUT", std::move(protobuf),
-    {{"Spotify-Connection-Id", std::move(connection_id)}});
+  auto const response{co_await state->request("/connect-state/v1/devices/" + net::form_encode(device_id), "PUT", std::move(protobuf),
+    {{"X-Spotify-Connection-Id", std::move(connection_id)}})};
+  if(state->on_log && !response.empty()) {
+    spotify::connectstate::Cluster cluster;
+    if(cluster.ParseFromString(response)) {
+      emit_log(state->on_log, log_level::debug, "service", "Connect response active_device=" + cluster.active_device_id()
+        + "; this_device_active=" + (cluster.active_device_id() == device_id ? "true" : "false")
+        + "; track=" + diagnostic_url(cluster.player_state().track().uri())
+        + "; paused=" + (cluster.player_state().is_paused() ? "true" : "false")
+        + "; buffering=" + (cluster.player_state().is_buffering() ? "true" : "false")
+        + "; duration_ms=" + std::to_string(cluster.player_state().duration()));
+    } else emit_log(state->on_log, log_level::warning, "service", "Connect response could not be decoded as a Cluster");
+  }
 }
 
 asio::awaitable<void> client::delete_connect_state(std::string device_id) {

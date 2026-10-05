@@ -129,7 +129,7 @@ Tests run offline against independent cipher/HMAC vectors, conversion vectors, g
 
 Streaming tests verify that the first PCM frame precedes a complete download, compare every sample of encrypted input, exercise seek/cache eviction and cancellation, and round-trip mono/stereo WAV output without changing integer or floating-point sample values. Service tests exercise client-token and Login5 hashcash challenges, token caching and a rejected-token refresh, metadata identity checks, and restricted storage responses.
 
-The Spotify authentication, metadata and streaming path has not yet been verified against a live Premium account. Album/artist/episode metadata, regional track alternatives, prefetch and persistent audio caching, full player events and context resolution, and normalisation remain to be implemented. The presence of protocol schemas does not imply those features are implemented.
+Access-point and Login5 authentication have been verified against a live account. Metadata and streaming have not yet been verified against a live Premium account. Album/artist/episode metadata, regional track alternatives, prefetch and persistent audio caching, full player events and context resolution, and normalisation remain to be implemented. The presence of protocol schemas does not imply those features are implemented.
 
 `session` serialises its internal work on its own strand and accepts independent concurrent requests. Packet callbacks execute on that strand and should return promptly. Its outgoing queue and pending request sets are bounded. A closed session must be recreated; automatic reconnection and resubscription are not implemented yet.
 
@@ -155,4 +155,18 @@ This example prints commands and publishes a control-only player state. It produ
 
 For embedding, combine `discovery::server` with your authentication/credential persistence policy, then create `oauth::service_auth` and `connect::receiver`. The command handler receives typed input and a proposed `player_state`; it updates that state and returns whether it accepted the command. The receiver publishes accepted state with command IDs and sends the Dealer reply. Keep HTTP, authentication, workers and executors alive until `receiver::shutdown()` and `discovery::server::shutdown()` complete. Call `close()` to request cancellation; destruction alone does not wait for asynchronous operations. Give service authentication to one receiver at a time, and await shutdown before replacing accounts. The example retains an access-point session for keepalive; the receiver itself consumes service authentication and Dealer transport.
 
-Offline tests cover independently generated pairing credentials, malformed envelopes, the real local HTTP server and TLS websocket, gzip limits, Connect registration and withdrawal, command acceptance/rejection, transfer state, queue controls, and token refresh on reconnection. Avahi publication, advertised SRV/TXT records, the local HTTP identity, and service removal on shutdown have also been checked against the system daemon. Device selection and command flow with a live Spotify account remain to be validated. Spotify's private protocols can change independently of this pinned reference.
+Offline tests cover independently generated pairing credentials, malformed envelopes, the real local HTTP server and TLS websocket, gzip limits, Connect registration and withdrawal, command acceptance/rejection, transfer state, queue controls, and token refresh on reconnection. Avahi publication, advertised SRV/TXT records, the local HTTP identity, and service removal on shutdown have also been checked against the system daemon. Live access-point/Login5 authentication, Dealer connection, Connect registration (HTTP 200), and withdrawal (HTTP 204) have been verified using a temporary device identity. Interactive device selection and command flow remain to be validated. Spotify's private protocols can change independently of this pinned reference.
+
+## Receiver diagnostics
+
+`connect_receiver` enables timestamped component logs at `debug` level by default. Logs identify pairing peers/actions, access-point endpoints and handshake stages, authentication challenges, Dealer TCP/TLS/websocket stages, received message types and URIs, Connect publications, HTTP statuses, the operation and exception that caused a disconnect, and reconnect delays.
+
+For decoded command and state JSON, websocket envelopes/replies, and ping/pong details:
+
+```sh
+./build/connect_receiver --name "C++ test device" --log-level trace
+```
+
+`--log-level` accepts `trace`, `debug`, `info`, `warning`, `error`, or `off`. Diagnostics go to stderr; timestamps show milliseconds since startup. Trace output is bounded and redacts access/client tokens, credentials, encrypted pairing blobs, opaque binary payloads, and URL query strings. Malformed JSON errors report their byte position without echoing input. HTTP authentication bodies and access-point login packets are never dumped.
+
+Library users opt in with the relevant configuration's `on_log` callback (`log_handler` receiving a `log_event` with severity, component and message). The library writes nothing to the console itself. Callbacks execute synchronously on the emitting executor and should return promptly; callback exceptions are contained. `receiver_config::on_status` remains available for application status notifications.

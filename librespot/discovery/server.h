@@ -6,6 +6,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include "pairing.h"
+#include "librespot/diagnostics.h"
 
 namespace librespot::discovery {
 
@@ -16,6 +17,7 @@ struct server_config {
   bool advertise{true};
   std::string active_user;
   std::function<void(std::string)> on_error;
+  log_handler on_log;
 };
 
 struct pairing_handler {

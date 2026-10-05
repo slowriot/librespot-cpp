@@ -50,7 +50,7 @@ private:
   std::unique_ptr<implementation> state;
 
 public:
-  client(net::http_transport &transport, oauth::service_auth &auth);
+  client(net::http_transport &transport, oauth::service_auth &auth, log_handler on_log = {});
   ~client();
   client(client const &) = delete;
   client &operator=(client const &) = delete;

@@ -79,6 +79,7 @@ struct service_auth::implementation {
 
   template<typename Response, typename Request>
   asio::awaitable<Response> exchange(std::string host, std::string target, Request message, std::optional<std::string> client_token = {}) {
+    emit_log(config.on_log, log_level::debug, "auth", "POST " + host + target + "; protobuf bytes=" + std::to_string(message.ByteSizeLong()));
     net::http_request request{
       .host{std::move(host)}, .port{"443"}, .target{std::move(target)}, .method{"POST"},
       .headers{{"Accept", "application/x-protobuf"}, {"Content-Type", "application/x-protobuf"}},
@@ -86,6 +87,7 @@ struct service_auth::implementation {
     };
     if(client_token) request.headers.emplace("client-token", *client_token);
     auto const response{co_await transport.request(std::move(request))};
+    emit_log(config.on_log, log_level::debug, "auth", "Authentication response HTTP " + std::to_string(response.status) + "; protobuf bytes=" + std::to_string(response.body.size()));
     if(response.status != 200) throw std::runtime_error{"service authentication returned HTTP " + std::to_string(response.status)};
     Response decoded;
     if(!decoded.ParseFromString(response.body)) throw std::runtime_error{"malformed service authentication response"};
@@ -100,7 +102,11 @@ service_auth::service_auth(net::http_transport &transport, service_auth_config c
 service_auth::~service_auth() = default;
 
 asio::awaitable<std::string> service_auth::client_token() {
-  if(state->client && !state->client->expired()) co_return state->client->value;
+  if(state->client && !state->client->expired()) {
+    emit_log(state->config.on_log, log_level::trace, "auth", "Using cached client token");
+    co_return state->client->value;
+  }
+  emit_log(state->config.on_log, log_level::debug, "auth", "Requesting client token");
   client_protocol::ClientTokenRequest request;
   request.set_request_type(client_protocol::REQUEST_CLIENT_DATA_REQUEST);
   auto &data{*request.mutable_client_data()};
@@ -122,6 +128,7 @@ asio::awaitable<std::string> service_auth::client_token() {
       auto lifetime{granted.expires_after_seconds()};
       if(granted.refresh_after_seconds() > 0) lifetime = std::min(lifetime, granted.refresh_after_seconds());
       state->client = access_token{.value{granted.token()}, .type{"Bearer"}, .scopes{}, .expires_at{expiry(lifetime)}};
+      emit_log(state->config.on_log, log_level::debug, "auth", "Client token granted; refresh in " + std::to_string(lifetime) + " seconds");
       co_return state->client->value;
     }
     if(response.response_type() != client_protocol::RESPONSE_CHALLENGES_RESPONSE || !response.has_challenges()) throw std::runtime_error{"client token was not granted"};
@@ -133,6 +140,7 @@ asio::awaitable<std::string> service_auth::client_token() {
     for(auto const &challenge : challenges.challenges()) {
       if(challenge.type() != client_protocol::CHALLENGE_HASH_CASH || !challenge.has_evaluate_hashcash_parameters()) throw std::runtime_error{"unsupported client token challenge"};
       auto const &parameters{challenge.evaluate_hashcash_parameters()};
+      emit_log(state->config.on_log, log_level::debug, "auth", "Solving client-token hashcash challenge; difficulty=" + std::to_string(parameters.length()));
       auto solution{co_await asio::co_spawn(state->worker, solve({}, decode_hex(parameters.prefix()), parameters.length()), asio::use_awaitable)};
       auto &answer{*request.mutable_challenge_answers()->add_answers()};
       answer.set_challengetype(client_protocol::CHALLENGE_HASH_CASH);
@@ -143,7 +151,11 @@ asio::awaitable<std::string> service_auth::client_token() {
 }
 
 asio::awaitable<access_token> service_auth::token() {
-  if(state->access && !state->access->expired()) co_return *state->access;
+  if(state->access && !state->access->expired()) {
+    emit_log(state->config.on_log, log_level::trace, "auth", "Using cached Login5 access token");
+    co_return *state->access;
+  }
+  emit_log(state->config.on_log, log_level::debug, "auth", "Authenticating reusable credentials through Login5");
   auto client{co_await client_token()};
   login_protocol::LoginRequest request;
   request.mutable_client_info()->set_client_id(state->config.client_id);
@@ -156,6 +168,7 @@ asio::awaitable<access_token> service_auth::token() {
       auto const &ok{response.ok()};
       validate_token(ok.access_token());
       state->access = access_token{.value{ok.access_token()}, .type{"Bearer"}, .scopes{}, .expires_at{expiry(ok.access_token_expires_in())}};
+      emit_log(state->config.on_log, log_level::info, "auth", "Login5 authentication accepted; token expires in " + std::to_string(ok.access_token_expires_in()) + " seconds");
       if(!ok.stored_credential().empty()) state->stored.data = ok.stored_credential();
       co_return *state->access;
     }
@@ -170,6 +183,7 @@ asio::awaitable<access_token> service_auth::token() {
     for(auto const &challenge : response.challenges().challenges()) {
       if(!challenge.has_hashcash()) throw std::runtime_error{"unsupported Login5 challenge"};
       auto const &parameters{challenge.hashcash()};
+      emit_log(state->config.on_log, log_level::debug, "auth", "Solving Login5 hashcash challenge; difficulty=" + std::to_string(parameters.length()));
       auto solution{co_await asio::co_spawn(state->worker, solve(response.login_context(), parameters.prefix(), parameters.length()), asio::use_awaitable)};
       auto &answer{*request.mutable_challenge_solutions()->add_solutions()->mutable_hashcash()};
       answer.set_suffix(solution.suffix.data(), solution.suffix.size());

@@ -8,6 +8,7 @@
 #include <string_view>
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
+#include "librespot/diagnostics.h"
 
 namespace librespot::net {
 
@@ -31,6 +32,7 @@ struct http_config {
   std::size_t body_limit{16 * 1024 * 1024};
   /// Omitted by default; a request header may override the application's value
   std::optional<std::string> user_agent;
+  log_handler on_log;
 };
 
 /// Implementations and their executors must outlive outstanding requests

@@ -6,6 +6,7 @@
 #include <boost/asio/awaitable.hpp>
 #include "control.h"
 #include "device.h"
+#include "librespot/diagnostics.h"
 #include "librespot/net/dealer.h"
 #include "librespot/service/client.h"
 
@@ -16,6 +17,7 @@ struct receiver_config {
   net::dealer_config dealer;
   bool reconnect{true};
   std::function<void(std::string)> on_status;
+  log_handler on_log;
 };
 
 /// Mutate the proposed state and return true only when the application accepts the command

@@ -13,6 +13,9 @@
 #include <boost/asio/strand.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <google/protobuf/util/json_util.h>
 #include <nlohmann/json.hpp>
 #include "connect.pb.h"
 #include "librespot/encoding/protocol.h"
@@ -53,6 +56,14 @@ void validate(player_state const &state) {
     || state.track.uri.size() > 4096 || state.context_uri.size() > 4096) throw std::invalid_argument{"invalid application player state"};
 }
 
+std::string diagnostic_message(google::protobuf::Message const &message) {
+  std::string json;
+  google::protobuf::util::JsonPrintOptions options;
+  options.preserve_proto_field_names = true;
+  if(!google::protobuf::util::MessageToJsonString(message, &json, options).ok()) return "<protobuf JSON unavailable>";
+  return diagnostic_json(json);
+}
+
 } // anonymous namespace
 
 struct receiver::implementation {
@@ -66,6 +77,7 @@ struct receiver::implementation {
   player_state player;
   proto::PutStateRequest registration;
   std::string connection_id;
+  std::uint64_t active_since{0};
   asio::steady_timer retry;
   asio::steady_timer finished;
   asio::cancellation_signal cancellation;
@@ -77,7 +89,12 @@ struct receiver::implementation {
   implementation(asio::any_io_executor executor, net::http_transport &http, oauth::service_auth &auth,
     receiver_config config, command_handler handler, std::shared_ptr<net::dealer_transport> dealer)
     : executor{asio::make_strand(std::move(executor))}, http{http}, auth{auth}, config{std::move(config)}, handler{std::move(handler)},
-      dealer{dealer ? std::move(dealer) : std::make_shared<net::dealer>(this->executor, this->config.dealer)}, service{http, auth}, retry{this->executor}, finished{this->executor} {
+      dealer{std::move(dealer)}, service{http, auth, this->config.on_log}, retry{this->executor}, finished{this->executor} {
+    if(!this->dealer) {
+      auto transport_config{this->config.dealer};
+      if(!transport_config.on_log) transport_config.on_log = this->config.on_log;
+      this->dealer = std::make_shared<net::dealer>(this->executor, std::move(transport_config));
+    }
     if(this->config.device.id.empty() || this->config.device.name.empty() || !this->handler) throw std::invalid_argument{"Connect identity and command handler are required"};
     finished.expires_at(std::chrono::steady_clock::time_point::max());
     player.volume = this->config.device.initial_volume;
@@ -106,10 +123,13 @@ struct receiver::implementation {
     capabilities.set_supports_set_options_command(true);
     capabilities.add_supported_types("audio/track");
     registration.set_member_type(proto::CONNECT_STATE);
-    registration.mutable_device()->mutable_player_state()->set_session_id(identity.id);
+    auto session_id{boost::uuids::to_string(boost::uuids::random_generator{}())};
+    std::erase(session_id, '-');
+    registration.mutable_device()->mutable_player_state()->set_session_id(std::move(session_id));
   }
 
   void status(std::string message) {
+    emit_log(config.on_log, log_level::info, "connect", message);
     if(config.on_status) {
       try {
         config.on_status(std::move(message));
@@ -120,6 +140,7 @@ struct receiver::implementation {
   }
 
   void stop() {
+    if(!stopped) emit_log(config.on_log, log_level::debug, "connect", "Stopping receiver and cancelling Dealer operations");
     stopped = true;
     cancellation.emit(asio::cancellation_type::all);
     dealer->close();
@@ -127,6 +148,7 @@ struct receiver::implementation {
   }
 
   asio::awaitable<std::vector<net::endpoint>> resolve() {
+    emit_log(config.on_log, log_level::debug, "connect", "Resolving Dealer endpoints");
     auto const response{co_await http.request({.host{"apresolve.spotify.com"}, .port{"443"}, .target{"/?type=dealer"}, .method{"GET"}, .headers{}, .body{}})};
     if(response.status != 200) throw std::runtime_error{"Dealer resolver failed"};
     auto object = nlohmann::json::parse(response.body);
@@ -143,6 +165,7 @@ struct receiver::implementation {
       if(host.empty() || host.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != std::string::npos
         || error != std::errc{} || end != port.data() + port.size() || number == 0 || number > 65535) throw std::runtime_error{"invalid Dealer address"};
       result.push_back({.host{host}, .port{port}});
+      emit_log(config.on_log, log_level::debug, "connect", "Resolved Dealer endpoint " + host + ':' + port);
     }
     co_return result;
   }
@@ -150,21 +173,27 @@ struct receiver::implementation {
   asio::awaitable<void> publish(proto::PutStateReason reason) {
     validate(player);
     auto const now{timestamp()};
+    if(!player.active) active_since = 0;
+    else if(active_since == 0) active_since = now;
     registration.set_put_state_reason(reason);
     registration.set_is_active(player.active);
+    registration.set_started_playing_at(active_since);
     registration.set_client_side_timestamp(now);
     registration.mutable_device()->mutable_device_info()->set_volume(player.volume);
     auto &state{*registration.mutable_device()->mutable_player_state()};
     state.set_timestamp(static_cast<std::int64_t>(now));
-    state.set_context_uri(player.context_uri);
+    auto const context{player.active && player.context_uri.empty() ? std::string{"spotify:unknown"} : player.context_uri};
+    state.set_context_uri(context);
+    state.set_context_url(context.empty() ? "" : "context://" + context);
     state.set_position_as_of_timestamp(player.position.count());
     state.set_position(player.position.count());
     state.set_duration(player.duration.count());
+    /// Spotify controllers require all three flags for a paused active player
     state.set_is_playing(player.active);
     state.set_is_paused(player.paused);
-    state.set_is_buffering(player.buffering);
+    state.set_is_buffering(player.buffering || (player.active && player.paused));
     state.set_is_system_initiated(true);
-    state.set_playback_speed(1.0);
+    state.set_playback_speed(player.paused ? 0.0 : 1.0);
     state.mutable_track()->set_uri(player.track.uri);
     state.mutable_track()->set_uid(player.track.uid);
     state.mutable_track()->set_provider("context");
@@ -187,13 +216,24 @@ struct receiver::implementation {
       item.set_uid(track.uid);
       item.set_provider("context");
     }
+    emit_log(config.on_log, log_level::debug, "connect", "Publishing " + proto::PutStateReason_Name(reason)
+      + "; device=" + config.device.id + "; active=" + (player.active ? "true" : "false")
+      + "; paused=" + (player.paused ? "true" : "false") + "; position_ms=" + std::to_string(player.position.count()));
+    if(config.on_log) emit_log(config.on_log, log_level::trace, "connect", "PutStateRequest " + diagnostic_message(registration));
     co_await service.put_connect_state(config.device.id, connection_id, registration.SerializeAsString());
     registered = true;
+    emit_log(config.on_log, log_level::debug, "connect", "Connect state publication accepted");
   }
 
   asio::awaitable<bool> control(command request) {
+    emit_log(config.on_log, log_level::debug, "connect", "Command endpoint=" + request.endpoint + "; message_id="
+      + std::to_string(request.message_id) + "; sender=" + request.sender);
+    if(config.on_log && !request.payload.empty()) emit_log(config.on_log, log_level::trace, "connect", "Decoded command " + diagnostic_json(request.payload));
     auto proposed{player};
-    if(!co_await handler(request, proposed)) co_return false;
+    if(!co_await handler(request, proposed)) {
+      emit_log(config.on_log, log_level::debug, "connect", "Application rejected command " + request.endpoint);
+      co_return false;
+    }
     validate(proposed);
     player = std::move(proposed);
     registration.set_last_command_message_id(request.message_id);
@@ -203,8 +243,10 @@ struct receiver::implementation {
   }
 
   asio::awaitable<void> handle(std::string bytes) {
+    if(config.on_log) emit_log(config.on_log, log_level::trace, "connect", "Dealer envelope " + diagnostic_json(bytes));
     auto message = nlohmann::json::parse(bytes);
     auto const type{message.at("type").get<std::string>()};
+    emit_log(config.on_log, log_level::debug, "connect", "Received Dealer " + type + "; bytes=" + std::to_string(bytes.size()));
     if(type == "pong") co_return;
     if(type == "ping") {
       co_await dealer->send("{\"type\":\"pong\"}");
@@ -212,20 +254,29 @@ struct receiver::implementation {
     }
     if(type == "request") {
       auto const key{message.at("key").get<std::string>()};
+      emit_log(config.on_log, log_level::debug, "connect", "Request " + diagnostic_url(message.at("message_ident").get<std::string>()));
       bool accepted{false};
       try {
-        if(!connection_id.empty() && message.at("message_ident").get<std::string>().starts_with("hm://connect-state/v1/player/command")) accepted = co_await control(decode_command(payload(message, true)));
-      } catch(std::exception const &) {
+        if(!connection_id.empty() && message.at("message_ident").get<std::string>().starts_with("hm://connect-state/v1/player/command")) {
+          auto const decoded{payload(message, true)};
+          if(config.on_log) emit_log(config.on_log, log_level::trace, "connect", "Decoded request " + diagnostic_json(decoded));
+          accepted = co_await control(decode_command(decoded));
+        }
+      } catch(std::exception const &error) {
+        emit_log(config.on_log, log_level::warning, "connect", "Command failed: " + diagnostic_error(error));
         status("Connect command rejected");
       }
+      emit_log(config.on_log, log_level::debug, "connect", "Reply success=" + std::string{accepted ? "true" : "false"});
       co_await dealer->send(nlohmann::json{{"type", "reply"}, {"key", key}, {"payload", {{"success", accepted}}}}.dump());
       co_return;
     }
     if(type != "message") throw std::runtime_error{"unknown Dealer envelope type"};
     auto const uri{message.at("uri").get<std::string>()};
+    emit_log(config.on_log, log_level::debug, "connect", "Message " + diagnostic_url(uri));
     if(uri.starts_with("hm://pusher/v1/connections/")) {
       connection_id = message.at("headers").at("Spotify-Connection-Id").get<std::string>();
       if(connection_id.empty() || connection_id.size() > 4096) throw std::runtime_error{"invalid Dealer connection ID"};
+      emit_log(config.on_log, log_level::debug, "connect", "Received Spotify connection ID; registering device");
       co_await publish(proto::NEW_DEVICE);
       status("Connect device registered");
     } else if(uri.starts_with("hm://connect-state/v1/connect/volume")) {
@@ -240,11 +291,17 @@ struct receiver::implementation {
     } else if(uri.starts_with("hm://connect-state/v1/cluster")) {
       proto::ClusterUpdate update;
       if(!update.ParseFromString(payload(message, false))) throw std::runtime_error{"invalid Connect cluster update"};
+      emit_log(config.on_log, log_level::debug, "connect", "Cluster update " + proto::ClusterUpdateReason_Name(update.update_reason())
+        + "; active_device=" + update.cluster().active_device_id());
+      if(config.on_log) emit_log(config.on_log, log_level::trace, "connect", "ClusterUpdate " + diagnostic_message(update));
       if(player.active && update.cluster().active_device_id() != config.device.id) {
         player.active = false;
+        active_since = 0;
         player.paused = true;
         status("Playback transferred to another device");
       }
+    } else {
+      emit_log(config.on_log, log_level::debug, "connect", "Ignoring unsubscribed Dealer message " + diagnostic_url(uri));
     }
   }
 
@@ -254,18 +311,24 @@ struct receiver::implementation {
     std::exception_ptr failure;
     unsigned int attempts{0};
     while(!self->stopped) {
+      std::string stage{"Dealer endpoint resolution"};
       try {
         auto const addresses{co_await self->resolve()};
         bool connected{false};
         for(auto const &address : addresses) {
           if(self->stopped) break;
           try {
+            stage = "service authentication";
+            emit_log(self->config.on_log, log_level::debug, "connect", "Obtaining access token for Dealer");
             auto const token{co_await self->auth.token()};
             if(self->stopped) break;
+            stage = "Dealer connection to " + address.host + ':' + address.port;
+            emit_log(self->config.on_log, log_level::debug, "connect", "Connecting to " + address.host + ':' + address.port);
             co_await self->dealer->connect(address, token.value);
             connected = true;
             break;
-          } catch(std::exception const &) {
+          } catch(std::exception const &error) {
+            if(!self->stopped) emit_log(self->config.on_log, log_level::warning, "connect", stage + " failed: " + diagnostic_error(error));
             self->dealer->close();
           }
         }
@@ -273,25 +336,35 @@ struct receiver::implementation {
         self->connection_id.clear();
         self->status("Dealer connected");
         while(!self->stopped) {
-          co_await self->handle(co_await self->dealer->receive());
+          stage = "Dealer receive";
+          auto bytes{co_await self->dealer->receive()};
+          stage = "Dealer message handling / Connect registration";
+          co_await self->handle(std::move(bytes));
           attempts = 0;
         }
-      } catch(std::exception const &) {
-        if(!self->stopped) failure = std::current_exception();
+      } catch(std::exception const &error) {
+        if(!self->stopped) {
+          failure = std::current_exception();
+          emit_log(self->config.on_log, log_level::error, "connect", stage + " failed: " + diagnostic_error(error));
+        }
       }
       self->dealer->close();
       if(self->stopped || !self->config.reconnect) break;
       self->auth.invalidate_token();
+      auto const delay{std::chrono::seconds{std::min(30u, 1u << std::min(attempts++, 5u))}};
       self->status("Dealer disconnected; reconnecting");
-      self->retry.expires_after(std::chrono::seconds{std::min(30u, 1u << std::min(attempts++, 5u))});
+      emit_log(self->config.on_log, log_level::debug, "connect", "Retrying in " + std::to_string(delay.count()) + " seconds");
+      self->retry.expires_after(delay);
       boost::system::error_code ignored;
       co_await self->retry.async_wait(asio::redirect_error(asio::use_awaitable, ignored));
     }
     co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     if(self->registered) {
       try {
+        emit_log(self->config.on_log, log_level::debug, "connect", "Withdrawing Connect device registration");
         co_await self->service.delete_connect_state(self->config.device.id);
-      } catch(std::exception const &) {
+      } catch(std::exception const &error) {
+        emit_log(self->config.on_log, log_level::warning, "connect", "Withdrawal failed: " + diagnostic_error(error));
         self->status("Connect registration could not be withdrawn");
       }
     }
