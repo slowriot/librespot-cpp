@@ -119,6 +119,7 @@ struct application : std::enable_shared_from_this<application> {
   std::unique_ptr<librespot::audio::paced_player> player;
   boost::asio::steady_timer player_finished;
   std::string playing_uri;
+  std::string playing_label;
   std::chrono::milliseconds playing_duration{0};
   bool player_running{false};
   std::string reported_error;
@@ -138,6 +139,7 @@ struct application : std::enable_shared_from_this<application> {
     }
     player.reset();
     playing_uri.clear();
+    playing_label.clear();
     reported_error.clear();
   }
 
@@ -200,6 +202,15 @@ struct application : std::enable_shared_from_this<application> {
         librespot::audio::cdn_source_config{.container_offset{librespot::service::is_vorbis(file.format) ? 167u : 0u}})};
       playing_uri = state.track.uri;
       playing_duration = track.duration;
+      for(auto const &artist : track.artists) {
+        if(artist.empty()) continue;
+        if(!playing_label.empty()) playing_label += ", ";
+        playing_label += artist;
+      }
+      if(!track.name.empty()) {
+        if(!playing_label.empty()) playing_label += " - ";
+        playing_label += track.name;
+      }
       std::shared_ptr<recording> output;
       std::function<void(librespot::audio::pcm_frame const &)> sink;
       if(output_path) {
@@ -212,7 +223,7 @@ struct application : std::enable_shared_from_this<application> {
         [source]{ return std::make_unique<librespot::audio::decoder>(source); },
         librespot::audio::paced_player_config{.position{state.position}, .paused{state.paused}, .on_frame{std::move(sink)},
           .cancel_source{[source]{ source->cancel(); }}, .on_log{config.on_log}});
-      librespot::emit_log(config.on_log, librespot::log_level::info, "playback", "Opening " + track.name + "; "
+      librespot::emit_log(config.on_log, librespot::log_level::info, "playback", "Opening " + (playing_label.empty() ? playing_uri : playing_label) + "; "
         + std::string{librespot::service::to_string(file.format)} + "; duration_ms=" + std::to_string(track.duration.count()));
       player_running = true;
       auto self{shared_from_this()};
@@ -230,7 +241,8 @@ struct application : std::enable_shared_from_this<application> {
     }
     state.duration = playing_duration;
     state.buffering = player && player->snapshot().buffering;
-    librespot::emit_log(config.on_log, librespot::log_level::info, "example", "Command " + command.endpoint + "; track=" + state.track.uri);
+    auto const &label{state.track.uri == playing_uri && !playing_label.empty() ? playing_label : state.track.uri};
+    librespot::emit_log(config.on_log, librespot::log_level::info, "example", "Command " + command.endpoint + "; track=" + label);
     co_return true;
   }
 
