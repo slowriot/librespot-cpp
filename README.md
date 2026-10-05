@@ -16,9 +16,9 @@ Requirements:
 CMake fetches pinned nlohmann JSON, Protobuf and its Abseil dependency, FFmpeg, and Catch2 sources from GitHub. The FFmpeg archive is checked against a SHA-256 digest. FFmpeg is built with just the required audio demuxers, decoders and parsers; NASM preserves its x86 assembly optimisations. Initial configuration requires network access.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 88
-ctest --test-dir build --output-on-failure --parallel 88
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure --parallel
 ```
 
 The FFmpeg build defaults to the detected CPU count. Override it with `-DLIBRESPOT_DEPENDENCY_JOBS=N`. Use `-DLIBRESPOT_USE_SYSTEM_FFMPEG=ON` to link an installed FFmpeg 8 or newer instead; this requires `pkg-config` and the `libavformat`, `libavcodec`, and `libavutil` development packages.
