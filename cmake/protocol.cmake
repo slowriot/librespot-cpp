@@ -24,9 +24,22 @@ add_library(librespot_protocol STATIC
   protocol/authentication.proto
   protocol/mercury.proto
   protocol/metadata.proto
+  protocol/connectivity.proto
+  protocol/extended_metadata.proto
+  protocol/entity_extension_data.proto
+  protocol/extension_kind.proto
+  protocol/storage-resolve.proto
+  protocol/spotify/clienttoken/v0/clienttoken_http.proto
+  protocol/spotify/login5/v3/login5.proto
+  protocol/spotify/login5/v3/client_info.proto
+  protocol/spotify/login5/v3/user_info.proto
+  protocol/spotify/login5/v3/challenges/code.proto
+  protocol/spotify/login5/v3/challenges/hashcash.proto
+  protocol/spotify/login5/v3/credentials/credentials.proto
+  protocol/spotify/login5/v3/identifiers/identifiers.proto
 )
 target_link_libraries(librespot_protocol PUBLIC protobuf::libprotobuf)
-target_include_directories(librespot_protocol PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(librespot_protocol PUBLIC "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/protocol")
 get_target_property(protobuf_include_dirs libprotobuf INTERFACE_INCLUDE_DIRECTORIES)
 target_include_directories(librespot_protocol SYSTEM PUBLIC ${protobuf_include_dirs})
-protobuf_generate(TARGET librespot_protocol)
+protobuf_generate(TARGET librespot_protocol IMPORT_DIRS "${PROJECT_SOURCE_DIR}/protocol" "${protobuf_SOURCE_DIR}/src")

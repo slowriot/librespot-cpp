@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
 project(librespot_cpp VERSION 0.1.0 LANGUAGES C CXX)
 option(LIBRESPOT_BUILD_EXAMPLES "Build example applications" ${PROJECT_IS_TOP_LEVEL})
-option(LIBRESPOT_ENABLE_SANITIZERS "Instrument project code with address and undefined behaviour sanitizers" OFF)
+option(LIBRESPOT_ENABLE_SANITIZERS "Instrument project code and CMake dependencies with address and undefined behaviour sanitizers" OFF)
+if(LIBRESPOT_ENABLE_SANITIZERS)
+  # Protobuf's inline container annotations require consistent runtime instrumentation
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
+endif()
 
 include(FetchContent)
 include(CTest)
@@ -32,14 +37,19 @@ add_library(librespot
   librespot/audio/decrypt.cpp
   librespot/audio/decoder.cpp
   librespot/audio/fetch.cpp
+  librespot/audio/cdn_source.cpp
+  librespot/audio/wav_writer.cpp
   librespot/net/http_client.cpp
   librespot/net/access_point.cpp
   librespot/net/resolve.cpp
   librespot/net/mercury.cpp
   librespot/oauth/device_auth.cpp
   librespot/oauth/access_token.cpp
+  librespot/oauth/service_auth.cpp
+  librespot/service/client.cpp
   librespot/crypto/shannon.cpp
   librespot/crypto/key_exchange.cpp
+  librespot/crypto/hashcash.cpp
   librespot/cache/credentials.cpp
   librespot/encoding/base64.cpp
 )
@@ -62,12 +72,13 @@ target_link_libraries(librespot
 )
 target_compile_options(librespot PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)
 if(LIBRESPOT_ENABLE_SANITIZERS)
-  target_compile_options(librespot PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(librespot INTERFACE -fsanitize=address,undefined)
 endif()
 
 if(LIBRESPOT_BUILD_EXAMPLES)
   add_executable(device_login examples/device_login.cpp)
+  add_executable(pcm_stream examples/pcm_stream.cpp)
+  target_link_libraries(pcm_stream PRIVATE librespot::librespot PRIVATE Boost::program_options)
   target_link_libraries(device_login
     PRIVATE librespot::librespot
     PRIVATE Boost::program_options
@@ -93,18 +104,18 @@ if(BUILD_TESTING)
     tests/fetch.cpp
     tests/session.cpp
     tests/access_token.cpp
+    tests/service.cpp
+    tests/streaming.cpp
   )
   target_link_libraries(librespot_tests
     PRIVATE librespot::librespot
     PRIVATE Catch2::Catch2WithMain
     PRIVATE OpenSSL::Crypto
     PRIVATE OpenSSL::SSL
+    PRIVATE librespot_protocol
   )
   target_compile_definitions(librespot_tests PRIVATE LIBRESPOT_TEST_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures")
-  if(LIBRESPOT_ENABLE_SANITIZERS)
-    target_compile_options(librespot_tests PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-  endif()
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
   include(Catch)
-  catch_discover_tests(librespot_tests)
+  catch_discover_tests(librespot_tests PROPERTIES TIMEOUT 30)
 endif()

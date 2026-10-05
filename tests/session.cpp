@@ -32,7 +32,8 @@ public:
 
   boost::asio::awaitable<librespot::credentials> connect(librespot::net::endpoint address, librespot::credentials login, std::string device_id) override {
     CHECK(address.host == "test.example");
-    CHECK(login.data == "token");
+    CHECK((login.data == "token" || login.data == "reusable"));
+    replies.reset();
     CHECK(device_id == "device");
     co_return librespot::credentials{.username{"test"}, .type{librespot::authentication_type::stored_spotify}, .data{"reusable"}};
   }

@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include "byte_source.h"
 
 namespace librespot::audio {
 
@@ -58,6 +59,7 @@ private:
 public:
   explicit decoder(std::filesystem::path const &path);
   explicit decoder(std::shared_ptr<std::vector<std::byte> const> bytes);
+  explicit decoder(std::shared_ptr<byte_source> source);
   ~decoder();
   decoder(decoder &&) noexcept;
   decoder &operator=(decoder &&) noexcept;

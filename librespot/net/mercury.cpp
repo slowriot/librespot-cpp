@@ -1,7 +1,7 @@
 #include "mercury.h"
 #include <limits>
 #include <stdexcept>
-#include "protocol/mercury.pb.h"
+#include "mercury.pb.h"
 
 namespace librespot::net {
 namespace {

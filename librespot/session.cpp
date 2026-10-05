@@ -171,6 +171,12 @@ struct session::implementation {
     for(auto const &address : addresses) {
       try {
         auto reusable{co_await self->connection->connect(address, login, self->config.device_id)};
+        if(login.type == authentication_type::spotify_token) {
+          /// Match upstream: token login supplies credentials for a reusable session
+          if(self->stopped) throw boost::system::system_error{asio::error::operation_aborted};
+          self->connection->close();
+          reusable = co_await self->connection->connect(address, reusable, self->config.device_id);
+        }
         if(self->stopped) {
           self->connection->close();
           throw boost::system::system_error{asio::error::operation_aborted};

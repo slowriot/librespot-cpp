@@ -13,8 +13,8 @@
 #include "librespot/crypto/key_exchange.h"
 #include "librespot/crypto/shannon.h"
 #include "librespot/version.h"
-#include "protocol/authentication.pb.h"
-#include "protocol/keyexchange.pb.h"
+#include "authentication.pb.h"
+#include "keyexchange.pb.h"
 #include "resolve.h"
 
 namespace librespot::net {

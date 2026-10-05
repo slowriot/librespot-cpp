@@ -1,6 +1,7 @@
 #include "decoder.h"
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -53,6 +54,29 @@ struct codec_deleter {
   }
 };
 
+class memory_source final : public byte_source {
+private:
+  std::shared_ptr<std::vector<std::byte> const> bytes;
+
+public:
+  explicit memory_source(std::shared_ptr<std::vector<std::byte> const> bytes) : bytes{std::move(bytes)} {
+    if(!this->bytes || this->bytes->empty() || this->bytes->size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+      throw std::invalid_argument{"invalid encoded audio buffer"};
+    }
+  }
+
+  std::uint64_t size() override {
+    return bytes->size();
+  }
+
+  std::size_t read_at(std::uint64_t offset, std::span<std::byte> destination) override {
+    if(offset >= bytes->size()) return 0;
+    auto const count{std::min(destination.size(), bytes->size() - static_cast<std::size_t>(offset))};
+    std::memcpy(destination.data(), bytes->data() + offset, count);
+    return count;
+  }
+};
+
 } // anonymous namespace
 
 struct pcm_frame::implementation {
@@ -64,7 +88,8 @@ struct pcm_frame::implementation {
 struct decoder::implementation {
   AVFormatContext *container{nullptr};
   AVIOContext *io{nullptr};
-  std::shared_ptr<std::vector<std::byte> const> bytes;
+  std::shared_ptr<byte_source> source;
+  std::exception_ptr source_failure;
   std::int64_t offset{0};
   std::unique_ptr<AVCodecContext, codec_deleter> codec;
   std::unique_ptr<AVPacket, packet_deleter> packet{av_packet_alloc()};
@@ -82,23 +107,38 @@ struct decoder::implementation {
   }
 
   static int read(void *opaque, std::uint8_t *buffer, int length) noexcept {
-    /// Supply bounded memory reads without permitting exceptions across the C ABI
+    /// Supply source reads without permitting exceptions across the C ABI
     auto &self{*static_cast<implementation *>(opaque)};
     if(length <= 0) return AVERROR(EINVAL);
-    auto const remaining{self.bytes->size() - static_cast<std::size_t>(self.offset)};
-    auto const count{std::min(remaining, static_cast<std::size_t>(length))};
-    if(count == 0) return AVERROR_EOF;
-    std::memcpy(buffer, self.bytes->data() + self.offset, count);
-    self.offset += static_cast<std::int64_t>(count);
-    return static_cast<int>(count);
+    try {
+      auto const count{self.source->read_at(static_cast<std::uint64_t>(self.offset),
+        {reinterpret_cast<std::byte *>(buffer), static_cast<std::size_t>(length)})};
+      if(count > static_cast<std::size_t>(length) || count > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max() - self.offset)) {
+        throw std::runtime_error{"invalid audio source read count"};
+      }
+      if(count == 0) return AVERROR_EOF;
+      self.offset += static_cast<std::int64_t>(count);
+      return static_cast<int>(count);
+    } catch(...) {
+      self.source_failure = std::current_exception();
+      return AVERROR_EXTERNAL;
+    }
   }
 
   static std::int64_t seek(void *opaque, std::int64_t offset, int origin) noexcept {
-    /// Implement FFmpeg's size query and checked absolute or relative memory seeks
+    /// Implement FFmpeg's size query and checked absolute or relative source seeks
     auto &self{*static_cast<implementation *>(opaque)};
-    auto const size{static_cast<std::int64_t>(self.bytes->size())};
-    if(origin == AVSEEK_SIZE) return size;
+    std::int64_t size{0};
+    try {
+      auto const source_size{self.source->size()};
+      if(source_size > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) throw std::runtime_error{"audio source too large"};
+      size = static_cast<std::int64_t>(source_size);
+    } catch(...) {
+      self.source_failure = std::current_exception();
+      return AVERROR_EXTERNAL;
+    }
     origin &= ~AVSEEK_FORCE;
+    if(origin == AVSEEK_SIZE) return size;
     std::int64_t base{0};
     if(origin == SEEK_CUR) base = self.offset;
     else if(origin == SEEK_END) base = size;
@@ -111,8 +151,12 @@ struct decoder::implementation {
   void open(char const *path) {
     /// Select one audio stream and open its native decoder
     if(!packet) throw std::bad_alloc{};
-    check(avformat_open_input(&container, path, nullptr, nullptr), "open audio container");
-    check(avformat_find_stream_info(container, nullptr), "read audio stream information");
+    auto result{avformat_open_input(&container, path, nullptr, nullptr)};
+    if(source_failure) std::rethrow_exception(source_failure);
+    check(result, "open audio container");
+    result = avformat_find_stream_info(container, nullptr);
+    if(source_failure) std::rethrow_exception(source_failure);
+    check(result, "read audio stream information");
     AVCodec const *selected{nullptr};
     stream_index = av_find_best_stream(container, AVMEDIA_TYPE_AUDIO, -1, -1, &selected, 0);
     check(stream_index, "find audio stream");
@@ -171,12 +215,14 @@ decoder::decoder(std::filesystem::path const &path) : state{std::make_unique<imp
   state->open(path.c_str());
 }
 
-decoder::decoder(std::shared_ptr<std::vector<std::byte> const> bytes) : state{std::make_unique<implementation>()} {
-  /// Retain encoded bytes without copying them and attach a seekable custom input
-  if(!bytes || bytes->empty() || bytes->size() > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
-    throw std::invalid_argument{"invalid encoded audio buffer"};
-  }
-  state->bytes = std::move(bytes);
+decoder::decoder(std::shared_ptr<std::vector<std::byte> const> bytes)
+  : decoder{std::make_shared<memory_source>(std::move(bytes))} {
+}
+
+decoder::decoder(std::shared_ptr<byte_source> source) : state{std::make_unique<implementation>()} {
+  /// Attach a seekable input; its blocking reads stay on the decoder's worker
+  if(!source) throw std::invalid_argument{"null audio source"};
+  state->source = std::move(source);
   auto const buffer{static_cast<unsigned char *>(av_malloc(32 * 1024))};
   if(!buffer) throw std::bad_alloc{};
   state->io = avio_alloc_context(buffer, 32 * 1024, 0, state.get(), implementation::read, nullptr, implementation::seek);
@@ -233,6 +279,7 @@ std::optional<pcm_frame> decoder::next() {
     do {
       av_packet_unref(state->packet.get());
       read_result = av_read_frame(state->container, state->packet.get());
+      if(state->source_failure) std::rethrow_exception(state->source_failure);
     } while(read_result >= 0 && state->packet->stream_index != state->stream_index);
     if(read_result == AVERROR_EOF) {
       state->draining = true;
@@ -250,6 +297,7 @@ void decoder::seek(std::chrono::microseconds position) {
   auto const stream{state->container->streams[state->stream_index]};
   auto const timestamp{av_rescale_q_rnd(position.count(), AVRational{1, 1'000'000}, stream->time_base, AV_ROUND_UP)};
   auto result{avformat_seek_file(state->container, state->stream_index, 0, timestamp, timestamp, 0)};
+  if(state->source_failure) std::rethrow_exception(state->source_failure);
   if(result < 0) {
     // a final FLAC frame can have no later timestamp to bound a binary seek
     if(auto const entry{avformat_index_get_entry_from_timestamp(stream, timestamp, AVSEEK_FLAG_BACKWARD)}) {
