@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -12,7 +13,10 @@
 #include <optional>
 #include <stdexcept>
 #include <syncstream>
+#include <system_error>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/io_context.hpp>
@@ -71,6 +75,46 @@ std::string stable_id(std::string const &name) {
   return result;
 }
 
+std::string track_label(librespot::service::track const &track) {
+  std::string artists;
+  for(auto const &artist : track.artists) {
+    if(artist.empty()) continue;
+    if(!artists.empty()) artists += ", ";
+    artists += artist;
+  }
+  if(artists.empty()) artists = "Unknown artist";
+  return artists + " - " + (track.name.empty() ? track.id.to_base62() : track.name);
+}
+
+std::string filename(std::string label) {
+  for(auto &byte : label) {
+    if(byte == '/' || byte == '\\' || static_cast<unsigned char>(byte) < 32 || byte == 127) byte = '_';
+  }
+  /// Leave space for duplicate suffixes and preserve complete UTF-8 characters
+  if(label.size() > 200) {
+    std::size_t end{200};
+    while(end > 0 && (static_cast<unsigned char>(label[end]) & 0xc0u) == 0x80u) --end;
+    label.resize(end);
+  }
+  return label + ".wav";
+}
+
+std::filesystem::path reserve_recording(std::filesystem::path const &preferred) {
+  auto path{preferred};
+  unsigned int suffix{1};
+  for(;;) {
+    auto const descriptor{::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666)};
+    if(descriptor >= 0) {
+      ::close(descriptor);
+      return path;
+    }
+    auto const error{errno};
+    if(error == EINTR) continue;
+    if(error != EEXIST) throw std::system_error{error, std::generic_category(), "cannot create WAV recording " + path.string()};
+    path = preferred.parent_path() / (preferred.stem().string() + " (" + std::to_string(++suffix) + ").wav");
+  }
+}
+
 struct recording {
   std::filesystem::path path;
   librespot::log_handler on_log;
@@ -78,7 +122,15 @@ struct recording {
 
   void append(librespot::audio::pcm_frame const &frame) {
     if(!writer) {
-      writer.emplace(path, frame.format());
+      if(!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+      path = reserve_recording(path);
+      try {
+        writer.emplace(path, frame.format());
+      } catch(...) {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        throw;
+      }
       librespot::emit_log(on_log, librespot::log_level::info, "recording", "Writing PCM to " + path.string());
     }
     writer->append(frame);
@@ -111,8 +163,7 @@ struct application : std::enable_shared_from_this<application> {
   librespot::net::http_transport &http;
   librespot::connect::receiver_config config;
   std::filesystem::path credentials_path;
-  std::optional<std::filesystem::path> output_path;
-  unsigned int recordings{0};
+  std::optional<std::filesystem::path> output_directory;
   std::unique_ptr<librespot::session> session;
   std::unique_ptr<librespot::oauth::service_auth> auth;
   std::unique_ptr<librespot::connect::receiver> receiver;
@@ -126,8 +177,8 @@ struct application : std::enable_shared_from_this<application> {
   bool stopped{false};
 
   application(boost::asio::any_io_executor executor, boost::asio::any_io_executor worker, librespot::net::http_transport &http,
-    librespot::connect::receiver_config config, std::filesystem::path credentials_path, std::optional<std::filesystem::path> output_path)
-    : executor{std::move(executor)}, worker{std::move(worker)}, http{http}, config{std::move(config)}, credentials_path{std::move(credentials_path)}, output_path{std::move(output_path)}, player_finished{this->executor} {
+    librespot::connect::receiver_config config, std::filesystem::path credentials_path, std::optional<std::filesystem::path> output_directory)
+    : executor{std::move(executor)}, worker{std::move(worker)}, http{http}, config{std::move(config)}, credentials_path{std::move(credentials_path)}, output_directory{std::move(output_directory)}, player_finished{this->executor} {
     player_finished.expires_at(std::chrono::steady_clock::time_point::max());
   }
 
@@ -202,20 +253,11 @@ struct application : std::enable_shared_from_this<application> {
         librespot::audio::cdn_source_config{.container_offset{librespot::service::is_vorbis(file.format) ? 167u : 0u}})};
       playing_uri = state.track.uri;
       playing_duration = track.duration;
-      for(auto const &artist : track.artists) {
-        if(artist.empty()) continue;
-        if(!playing_label.empty()) playing_label += ", ";
-        playing_label += artist;
-      }
-      if(!track.name.empty()) {
-        if(!playing_label.empty()) playing_label += " - ";
-        playing_label += track.name;
-      }
+      playing_label = track_label(track);
       std::shared_ptr<recording> output;
       std::function<void(librespot::audio::pcm_frame const &)> sink;
-      if(output_path) {
-        auto path{*output_path};
-        if(++recordings > 1) path = path.parent_path() / (path.stem().string() + '-' + std::to_string(recordings) + path.extension().string());
+      if(output_directory) {
+        auto path{*output_directory / filename(playing_label)};
         output = std::make_shared<recording>(std::move(path), config.on_log, std::nullopt);
         sink = [output](librespot::audio::pcm_frame const &frame){ output->append(frame); };
       }
@@ -350,7 +392,8 @@ auto main(int argc, char const *argv[])->int try {
     ("name", boost::program_options::value<std::string>()->default_value("C++ Connect test"), "Device name in Spotify")
     ("device-id", boost::program_options::value<std::string>(), "Stable device identity; otherwise derived from machine ID and name")
     ("credentials", boost::program_options::value<std::string>()->default_value("connect_credentials.json"), "Owner-only reusable credential file")
-    ("output", boost::program_options::value<std::string>(), "Record consumed PCM to WAV; later streams use -2, -3 suffixes")
+    ("output-dir", boost::program_options::value<std::string>(), "Record WAVs here, named artist - title.wav")
+    ("output", boost::program_options::value<std::string>(), "Record named WAVs in this path's parent directory")
     ("brand", boost::program_options::value<std::string>()->default_value(""), "Application device brand")
     ("model", boost::program_options::value<std::string>()->default_value(""), "Application device model")
     ("client-id", boost::program_options::value<std::string>()->default_value(librespot::connect::device_config{}.client_id), "Spotify protocol client identity")
@@ -377,8 +420,11 @@ auto main(int argc, char const *argv[])->int try {
   boost::asio::thread_pool worker{2};
   auto const agent{arguments.at("user-agent").as<std::string>()};
   librespot::net::http_client http{executor.get_executor(), {.user_agent{agent}, .on_log{logger}}};
+  if(arguments.contains("output") && arguments.contains("output-dir")) throw std::invalid_argument{"use either --output or --output-dir"};
   std::optional<std::filesystem::path> output;
-  if(arguments.contains("output")) output = arguments.at("output").as<std::string>();
+  if(arguments.contains("output-dir")) output = arguments.at("output-dir").as<std::string>();
+  else if(arguments.contains("output")) output = std::filesystem::path{arguments.at("output").as<std::string>()}.parent_path();
+  if(output && output->empty()) *output = ".";
   auto app{std::make_shared<application>(executor.get_executor(), worker.get_executor(), http,
     librespot::connect::receiver_config{.device{identity}, .dealer{.user_agent{agent}}, .on_log{logger}}, arguments.at("credentials").as<std::string>(), std::move(output))};
   librespot::discovery::server discovery{executor.get_executor(), {
