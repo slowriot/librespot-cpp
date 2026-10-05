@@ -9,6 +9,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/redirect_error.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/use_future.hpp>
@@ -300,6 +301,45 @@ TEST_CASE("Connect handoff publishes active ownership before acknowledging the t
   CHECK(dealer->replies.size() == 1);
   CHECK(http.deletes == 1);
   CHECK(diagnostics.find("Connect response active_device=device; this_device_active=true") != std::string::npos);
+}
+
+TEST_CASE("Connect publishes playback progress while the Dealer connection is idle") {
+  asio::io_context executor;
+  asio::thread_pool worker{1};
+  fake_http http;
+  librespot::oauth::service_auth auth{http, {.device_id{"device"}},
+    {.username{"username"}, .type{librespot::authentication_type::stored_spotify}, .data{"stored"}}, worker.get_executor()};
+  auto dealer{std::make_shared<fake_dealer>(executor.get_executor())};
+  librespot::connect::receiver receiver{executor.get_executor(), http, auth,
+    {.device{.id{"device"}, .name{"test"}}, .reconnect{false}, .on_state{[](librespot::connect::player_state &state){
+      if(state.active && !state.paused) state.position += std::chrono::milliseconds{100};
+    }}, .state_interval{std::chrono::milliseconds{100}}},
+    [](librespot::connect::command const &command, librespot::connect::player_state &state)->asio::awaitable<bool> {
+      co_return librespot::connect::apply_control(command, state);
+    }, dealer};
+  dealer->on_connect = [&](unsigned int){
+    dealer->push(connection("connection-id"));
+    dealer->push(request("play", {{"endpoint", "play"}, {"track", {{"uri", "spotify:track:current"}}}}));
+    proto::ClusterUpdate old_cluster;
+    old_cluster.mutable_cluster()->set_changed_timestamp_ms(1);
+    old_cluster.mutable_cluster()->set_active_device_id("previous-device");
+    dealer->push({{"type", "message"}, {"uri", "hm://connect-state/v1/cluster"}, {"payloads", {base64::encode(old_cluster.SerializeAsString())}}});
+  };
+  auto running{asio::co_spawn(executor, receiver.run(), asio::use_future)};
+  auto finish{asio::co_spawn(executor, [&]()->asio::awaitable<void> {
+    asio::steady_timer timer{executor};
+    timer.expires_after(std::chrono::milliseconds{450});
+    co_await timer.async_wait(asio::use_awaitable);
+    receiver.close();
+  }, asio::use_future)};
+  executor.run();
+  finish.get();
+  running.get();
+  worker.join();
+  REQUIRE(http.registrations.size() >= 4);
+  CHECK(http.registrations.back().device().player_state().position_as_of_timestamp() >= 200);
+  CHECK(dealer->replies.size() == 1);
+  CHECK(http.deletes == 1);
 }
 
 TEST_CASE("Connect transfer resolves binary track IDs and selects the current queued track") {

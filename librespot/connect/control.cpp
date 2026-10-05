@@ -124,9 +124,11 @@ bool apply_control(command const &request, player_state &state) {
   case command_type::play:
     state.active = true;
     state.paused = request.paused.value_or(false);
-    state.context_uri = request.context_uri;
-    state.track = request.track;
-    state.position = request.position.value_or(std::chrono::milliseconds{0});
+    if(!request.context_uri.empty() || !request.track.uri.empty()) {
+      state.context_uri = request.context_uri;
+      state.track = request.track;
+      state.position = request.position.value_or(std::chrono::milliseconds{0});
+    } else if(request.position) state.position = *request.position;
     break;
   case command_type::pause: state.paused = true; break;
   case command_type::resume: state.active = true; state.paused = false; break;

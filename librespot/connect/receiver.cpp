@@ -8,6 +8,7 @@
 #include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/redirect_error.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
@@ -64,6 +65,33 @@ std::string diagnostic_message(google::protobuf::Message const &message) {
   return diagnostic_json(json);
 }
 
+struct inbox {
+  asio::experimental::channel<asio::any_io_executor, void(boost::system::error_code, std::string)> messages;
+  asio::steady_timer tick;
+  asio::steady_timer finished;
+  std::exception_ptr failure;
+  bool stopped{false};
+  unsigned int tasks{0};
+  explicit inbox(asio::any_io_executor executor) : messages{executor, 16}, tick{executor}, finished{executor} {
+    finished.expires_at(std::chrono::steady_clock::time_point::max());
+  }
+};
+
+asio::awaitable<void> receive_messages(std::shared_ptr<net::dealer_transport> dealer, std::shared_ptr<inbox> input) {
+  while(!input->stopped) {
+    auto message{co_await dealer->receive()};
+    co_await input->messages.async_send(boost::system::error_code{}, std::move(message), asio::use_awaitable);
+  }
+}
+
+asio::awaitable<void> playback_ticks(std::shared_ptr<inbox> input, std::chrono::milliseconds interval) {
+  while(!input->stopped) {
+    input->tick.expires_after(interval);
+    co_await input->tick.async_wait(asio::use_awaitable);
+    input->messages.try_send(boost::system::error_code{}, std::string{});
+  }
+}
+
 } // anonymous namespace
 
 struct receiver::implementation {
@@ -85,6 +113,7 @@ struct receiver::implementation {
   bool started{false};
   bool done{false};
   bool registered{false};
+  std::shared_ptr<inbox> input;
 
   implementation(asio::any_io_executor executor, net::http_transport &http, oauth::service_auth &auth,
     receiver_config config, command_handler handler, std::shared_ptr<net::dealer_transport> dealer)
@@ -99,6 +128,7 @@ struct receiver::implementation {
     finished.expires_at(std::chrono::steady_clock::time_point::max());
     player.volume = this->config.device.initial_volume;
     auto &device{*registration.mutable_device()->mutable_device_info()};
+    if(this->config.state_interval < std::chrono::milliseconds{100}) throw std::invalid_argument{"Connect state interval must be at least 100 ms"};
     auto const &identity{this->config.device};
     device.set_can_play(true);
     device.set_name(identity.name);
@@ -144,6 +174,11 @@ struct receiver::implementation {
     stopped = true;
     cancellation.emit(asio::cancellation_type::all);
     dealer->close();
+    if(input) {
+      input->stopped = true;
+      input->tick.cancel();
+      input->messages.cancel();
+    }
     retry.cancel();
   }
 
@@ -226,6 +261,7 @@ struct receiver::implementation {
   }
 
   asio::awaitable<bool> control(command request) {
+    if(config.on_state) config.on_state(player);
     emit_log(config.on_log, log_level::debug, "connect", "Command endpoint=" + request.endpoint + "; message_id="
       + std::to_string(request.message_id) + "; sender=" + request.sender);
     if(config.on_log && !request.payload.empty()) emit_log(config.on_log, log_level::trace, "connect", "Decoded command " + diagnostic_json(request.payload));
@@ -294,10 +330,14 @@ struct receiver::implementation {
       emit_log(config.on_log, log_level::debug, "connect", "Cluster update " + proto::ClusterUpdateReason_Name(update.update_reason())
         + "; active_device=" + update.cluster().active_device_id());
       if(config.on_log) emit_log(config.on_log, log_level::trace, "connect", "ClusterUpdate " + diagnostic_message(update));
-      if(player.active && update.cluster().active_device_id() != config.device.id) {
+      auto const changed{update.cluster().changed_timestamp_ms()};
+      auto const stale{changed > 0 && static_cast<std::uint64_t>(changed) < active_since};
+      if(stale) emit_log(config.on_log, log_level::debug, "connect", "Ignoring cluster state from before this device acquired playback");
+      if(player.active && !stale && update.cluster().active_device_id() != config.device.id) {
         player.active = false;
         active_since = 0;
         player.paused = true;
+        if(config.on_state) config.on_state(player);
         status("Playback transferred to another device");
       }
     } else {
@@ -335,9 +375,34 @@ struct receiver::implementation {
         if(!connected) throw std::runtime_error{"Dealer endpoints unavailable"};
         self->connection_id.clear();
         self->status("Dealer connected");
+        self->input = std::make_shared<inbox>(self->executor);
+        auto const input{self->input};
+        auto completed{[input](std::exception_ptr failure){
+          if(failure && !input->stopped) {
+            input->failure = failure;
+            input->messages.try_send(boost::system::error_code{}, std::string{});
+          }
+          --input->tasks;
+          input->finished.cancel();
+        }};
+        ++input->tasks;
+        asio::co_spawn(self->executor, receive_messages(self->dealer, input), completed);
+        if(self->config.on_state) {
+          ++input->tasks;
+          asio::co_spawn(self->executor, playback_ticks(input, self->config.state_interval), completed);
+        }
         while(!self->stopped) {
           stage = "Dealer receive";
-          auto bytes{co_await self->dealer->receive()};
+          auto bytes{co_await input->messages.async_receive(asio::use_awaitable)};
+          if(input->failure) std::rethrow_exception(input->failure);
+          if(bytes.empty()) {
+            if(self->config.on_state && self->player.active && self->registered) {
+              stage = "playback state publication";
+              self->config.on_state(self->player);
+              co_await self->publish(proto::PLAYER_STATE_CHANGED);
+            }
+            continue;
+          }
           stage = "Dealer message handling / Connect registration";
           co_await self->handle(std::move(bytes));
           attempts = 0;
@@ -349,6 +414,18 @@ struct receiver::implementation {
         }
       }
       self->dealer->close();
+      if(self->input) {
+        auto const input{self->input};
+        input->stopped = true;
+        input->tick.cancel();
+        input->messages.cancel();
+        co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
+        while(input->tasks != 0) {
+          boost::system::error_code ignored;
+          co_await input->finished.async_wait(asio::redirect_error(asio::use_awaitable, ignored));
+        }
+        self->input.reset();
+      }
       if(self->stopped || !self->config.reconnect) break;
       self->auth.invalidate_token();
       auto const delay{std::chrono::seconds{std::min(30u, 1u << std::min(attempts++, 5u))}};

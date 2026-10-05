@@ -18,6 +18,9 @@ struct receiver_config {
   bool reconnect{true};
   std::function<void(std::string)> on_status;
   log_handler on_log;
+  /// Refresh playback position/status synchronously on the receiver executor; must not block
+  std::function<void(player_state &)> on_state;
+  std::chrono::milliseconds state_interval{1000};
 };
 
 /// Mutate the proposed state and return true only when the application accepts the command

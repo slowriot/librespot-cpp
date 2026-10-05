@@ -40,6 +40,7 @@ add_library(librespot
   librespot/core/spotify_uri.cpp
   librespot/audio/decrypt.cpp
   librespot/audio/decoder.cpp
+  librespot/audio/paced_player.cpp
   librespot/audio/fetch.cpp
   librespot/audio/cdn_source.cpp
   librespot/audio/wav_writer.cpp
@@ -121,6 +122,7 @@ if(BUILD_TESTING)
     tests/access_token.cpp
     tests/service.cpp
     tests/streaming.cpp
+    tests/paced_player.cpp
     tests/discovery.cpp
     tests/connect.cpp
     tests/diagnostics.cpp
