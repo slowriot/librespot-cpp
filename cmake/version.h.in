@@ -1,0 +1,9 @@
+#pragma once
+#include <string_view>
+
+namespace librespot {
+
+inline std::string_view constexpr version{"@PROJECT_VERSION@"};
+inline std::string_view constexpr upstream_revision{"939dc5ee9d833e1980f9495241219d9d4868a061"};
+
+} // namespace librespot
