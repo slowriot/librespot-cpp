@@ -84,9 +84,12 @@ command decode_command(std::string const &json) {
     auto const &options{body.at("options")};
     boolean(options, "initially_paused", result.paused);
     if(options.contains("seek_to") && !options.at("seek_to").is_null()) result.position = std::chrono::milliseconds{options.at("seek_to").get<std::uint32_t>()};
-    if(options.contains("skip_to") && options.at("skip_to").is_object()) result.track.uri = options.at("skip_to").value("track_uri", "");
-    if(result.track.uri.empty() && result.context_uri.starts_with("spotify:track:")) result.track.uri = result.context_uri;
+    if(options.contains("skip_to") && options.at("skip_to").is_object()) {
+      auto const uri{options.at("skip_to").value("track_uri", "")};
+      if(!uri.empty()) result.track.uri = uri;
+    }
   }
+  if(result.type == command_type::play && result.track.uri.empty() && result.context_uri.starts_with("spotify:track:")) result.track.uri = result.context_uri;
   if(result.type == command_type::transfer && body.contains("data") && !body.at("data").is_null()) {
     auto const data{encoding::decode_base64(body.at("data").get<std::string>())};
     spotify::player::proto::transfer::TransferState transfer;

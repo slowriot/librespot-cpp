@@ -262,12 +262,12 @@ struct receiver::implementation {
 
   asio::awaitable<bool> control(command request) {
     if(config.on_state) config.on_state(player);
-    emit_log(config.on_log, log_level::debug, "connect", "Command endpoint=" + request.endpoint + "; message_id="
+    emit_log(config.on_log, log_level::info, "connect", "Command endpoint=" + request.endpoint + "; message_id="
       + std::to_string(request.message_id) + "; sender=" + request.sender);
     if(config.on_log && !request.payload.empty()) emit_log(config.on_log, log_level::trace, "connect", "Decoded command " + diagnostic_json(request.payload));
     auto proposed{player};
     if(!co_await handler(request, proposed)) {
-      emit_log(config.on_log, log_level::debug, "connect", "Application rejected command " + request.endpoint);
+      emit_log(config.on_log, log_level::warning, "connect", "Application rejected command " + request.endpoint);
       co_return false;
     }
     validate(proposed);

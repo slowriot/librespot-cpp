@@ -420,6 +420,30 @@ TEST_CASE("Connect transfer decodes protobuf state, options and queues without a
   CHECK(player.previous_tracks.front().uri == "spotify:track:current");
 }
 
+TEST_CASE("Connect single-track play works without options and preserves an explicit track when skipping by UID") {
+  auto const uri{"spotify:track:0123456789012345678901"};
+  auto body = nlohmann::json{{"endpoint", "play"}, {"context", {{"uri", uri}}}};
+  auto decode{[&]{
+    return librespot::connect::decode_command(nlohmann::json{{"message_id", 7}, {"sent_by_device_id", "controller"}, {"command", body}}.dump());
+  }};
+  SECTION("Single-track context without options") {
+    auto const command{decode()};
+    CHECK(command.track.uri == uri);
+    librespot::connect::player_state state;
+    CHECK(librespot::connect::apply_control(command, state));
+    CHECK(state.track.uri == uri);
+    CHECK_FALSE(state.paused);
+  }
+  SECTION("UID selector does not erase the explicit track") {
+    body["context"]["uri"] = "spotify:playlist:list";
+    body["track"] = {{"uri", uri}, {"uid", "selected"}};
+    body["options"] = {{"skip_to", {{"track_uid", "selected"}}}};
+    auto const command{decode()};
+    CHECK(command.track.uri == uri);
+    CHECK(command.track.uid == "selected");
+  }
+}
+
 TEST_CASE("Dealer gzip decoding rejects truncation, trailing data, and expansion beyond the limit") {
   auto const compressed{gzip("protocol payload")};
   CHECK(librespot::encoding::inflate_gzip(compressed) == "protocol payload");

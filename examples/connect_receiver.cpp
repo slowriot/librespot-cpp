@@ -218,17 +218,34 @@ struct application : std::enable_shared_from_this<application> {
   }
 
   boost::asio::awaitable<bool> control(librespot::connect::command const &command, librespot::connect::player_state &state) {
-    if(stopped || !librespot::connect::apply_control(command, state)) co_return false;
+    if(stopped) co_return false;
+    if(!librespot::connect::apply_control(command, state)) {
+      librespot::emit_log(config.on_log, librespot::log_level::warning, "playback", "Cannot apply " + command.endpoint
+        + "; next_tracks=" + std::to_string(state.next_tracks.size()) + "; previous_tracks=" + std::to_string(state.previous_tracks.size()));
+      co_return false;
+    }
     auto const playback{player ? std::optional{player->snapshot()} : std::nullopt};
     if(playback && playback->ended
       && (command.type == librespot::connect::command_type::resume || command.type == librespot::connect::command_type::play)) state.position = std::chrono::milliseconds{0};
     if(state.active && (state.track.uri != playing_uri || !player || !player_running || playback->ended || !playback->error.empty())) {
       auto const parsed{librespot::parse_uri(state.track.uri)};
       auto const *uri{parsed ? std::get_if<librespot::catalog_uri>(&*parsed) : nullptr};
-      if(!uri || uri->type != librespot::item_type::track) co_return false;
+      if(!uri || uri->type != librespot::item_type::track) {
+        librespot::emit_log(config.on_log, librespot::log_level::warning, "playback", "No playable track URI for " + command.endpoint
+          + "; context=" + librespot::diagnostic_url(state.context_uri) + "; playlist/context resolution is not implemented");
+        co_return false;
+      }
       co_await stop_player();
       librespot::service::client service{http, *auth, config.on_log};
       auto track{co_await service.get_track(uri->id)};
+      if(config.on_log) {
+        std::string formats;
+        for(auto const &candidate : track.files) {
+          if(!formats.empty()) formats += ", ";
+          formats += librespot::service::to_string(candidate.format);
+        }
+        librespot::emit_log(config.on_log, librespot::log_level::info, "playback", "Available audio formats: " + formats);
+      }
       auto file{librespot::service::select_audio(track)};
       std::vector<std::string> urls;
       for(;;) {
@@ -236,6 +253,8 @@ struct application : std::enable_shared_from_this<application> {
           urls = co_await service.resolve_audio(file.id);
           break;
         } catch(librespot::service::storage_unavailable const &) {
+          librespot::emit_log(config.on_log, librespot::log_level::warning, "playback", std::string{librespot::service::to_string(file.format)}
+            + " is restricted or has no CDN storage; trying another format");
           std::erase_if(track.files, [&file](librespot::service::audio_file const &candidate){ return candidate.id == file.id; });
           if(track.files.empty()) throw;
           file = librespot::service::select_audio(track);
@@ -278,7 +297,9 @@ struct application : std::enable_shared_from_this<application> {
         self->player_finished.cancel();
       });
     } else if(player) {
-      if(command.type == librespot::connect::command_type::seek || command.type == librespot::connect::command_type::transfer) player->seek(state.position);
+      if(command.type == librespot::connect::command_type::seek || command.type == librespot::connect::command_type::transfer
+        || command.type == librespot::connect::command_type::next || command.type == librespot::connect::command_type::previous
+        || (command.type == librespot::connect::command_type::play && (command.position || !command.track.uri.empty()))) player->seek(state.position);
       player->pause(state.paused || !state.active);
     }
     state.duration = playing_duration;
