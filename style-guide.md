@@ -636,6 +636,7 @@ for(size_t i{0}; i != item_count; ++i) {
 
 - Prefer scoped enums (`enum class`) over unscoped enums.
 - Use lowercase snake_case names for enum types and enumerators.
+- Place each enumerator on its own line; never combine multiple enumerators on one line.
 - If an enum is stored/transmitted/packed, specify an explicit underlying type sized to the value range (for example `uint8_t`).
 - For purely internal enums without storage/ABI constraints, an explicit underlying type is optional.
 - Convert enums explicitly when integer conversion is required (`static_cast`), rather than relying on implicit conversion.
@@ -1095,6 +1096,8 @@ public:
   - `[](int value){`
 - If a lambda has a trailing return type, keep `)->type` compact with no spaces around `->`, and keep the single ordinary body-opening space before `{`:
   - `[](size_t count)->float {`
+- For a lambda kept entirely on one line, do not add spaces immediately inside the body braces:
+  - `[&](auto const &plane){return plane.contains(point);}`
 - Do not specify a lambda trailing return type unless inference is insufficient or the annotation materially improves clarity.
 
 Example:
